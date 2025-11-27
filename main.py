@@ -15,9 +15,9 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
-    AIORateLimiter,
     filters,
 )
+
 
 from dexscreener_service import (
     get_token_pairs_by_address,
@@ -231,12 +231,12 @@ def main():
         raise SystemExit("BOT_TOKEN is missing")
 
     app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .rate_limiter(AIORateLimiter())
-        .post_init(post_init)
-        .build()
-    )
+    Application.builder()
+    .token(BOT_TOKEN)
+    .post_init(post_init)
+    .build()
+)
+
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("price", price))

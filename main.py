@@ -1,7 +1,6 @@
 import os
 import time
 import logging
-import asyncio
 from collections import deque
 
 import aiohttp
@@ -16,6 +15,7 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
+    AIORateLimiter,
     filters,
 )
 
@@ -24,7 +24,7 @@ from dexscreener_service import (
     pick_best_pair,
 )
 
-# ------------------ НАСТРОЙКИ ------------------
+# ------------ НАСТРОЙКИ ------------
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -38,21 +38,16 @@ logger = logging.getLogger(__name__)
 tracked_tokens: dict[str, dict] = {}
 
 
-# ------------------ УТИЛИТЫ ------------------
+# ------------ УТИЛИТЫ ------------
 
 def check_anomalies(history: deque[tuple[float, float]]):
-    """
-    history: deque[(timestamp, volume24h)]
-    Возвращает список строк-описаний аномалий.
-    Аномалия = изменение объёма ≥ 20% на окнах 5s–24h.
-    """
+    """Возвращает список строк с аномалиями (изменение объёма ≥ 20% на окнах 5s–24h)."""
     if len(history) < 2:
         return []
 
     now_ts, last_vol = history[-1]
     alerts: list[str] = []
 
-    # таймфреймы в секундах
     windows = [
         ("5s", 5),
         ("15s", 15),
@@ -66,7 +61,6 @@ def check_anomalies(history: deque[tuple[float, float]]):
     ]
 
     for label, span in windows:
-        # ищем первое значение старше span
         old_vol = None
         for ts, vol in history:
             if now_ts - ts >= span:
@@ -84,7 +78,7 @@ def check_anomalies(history: deque[tuple[float, float]]):
     return alerts
 
 
-# ------------------ ХЕНДЛЕРЫ КОМАНД ------------------
+# ------------ КОМАНДЫ ------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -106,7 +100,7 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"₿ Bitcoin: ${btc_price:,}")
 
 
-# ------------------ ОБРАБОТКА СООБЩЕНИЙ (КОНТРАКТ) ------------------
+# ------------ ОБРАБОТКА КОНТРАКТА ------------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     address = update.message.text.strip()
@@ -119,7 +113,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if pair:
         price = pair.get("priceUsd", "N/A")
-
         volume_info = pair.get("volume") or {}
         volume_24h = volume_info.get("h24", 0) or 0
 
@@ -153,7 +146,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Токен не найден. Проверь адрес!")
 
 
-# ------------------ КНОПКИ ------------------
+# ------------ КНОПКИ ------------
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -183,13 +176,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ------------------ ФОНОВЫЙ МОНИТОРИНГ ------------------
+# ------------ ФОНОВЫЙ МОНИТОР ------------
 
 async def volume_watcher(app: Application):
-    """
-    Каждые ~5 секунд обходит все отслеживаемые адреса,
-    тянет объём 24h и считает аномалии.
-    """
     while True:
         if not tracked_tokens:
             await asyncio.sleep(5)
@@ -222,33 +211,41 @@ async def volume_watcher(app: Application):
                                 await app.bot.send_message(chat_id=uid, text=msg)
                             except Exception as e:
                                 logger.warning(f"Send alert error: {e}")
-
                 except Exception as e:
                     logger.warning(f"Volume watcher error for {address}: {e}")
 
         await asyncio.sleep(5)
 
 
-# ------------------ ЗАПУСК ПРИЛОЖЕНИЯ ------------------
+async def post_init(app: Application):
+    """Хук, который вызывается после старта приложения — тут поднимаем вочер."""
+    app.create_task(volume_watcher(app))
+    logger.info("🚀 Volume watcher запущен…")
 
-async def run():
+
+# ------------ MAIN ------------
+
+def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN не найден. Проверь переменную в Railway.")
         raise SystemExit("BOT_TOKEN is missing")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .rate_limiter(AIORateLimiter())
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("price", price))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
 
-    # запускаем фонового вочера
-    asyncio.create_task(volume_watcher(app))
-
-    logger.info("🚀 Бот запущен с volume watcher…")
-    await app.run_polling()
+    logger.info("🚀 Бот запущен…")
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    main()

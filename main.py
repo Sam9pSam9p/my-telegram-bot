@@ -33,18 +33,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# address -> {"last_checks": deque[(ts, vol24h)], "last_alert": float, "subscribers": set[int]}
+# address -> {"last_checks": deque[(ts, vol_m5)], "last_alert": float, "subscribers": set[int]}
 tracked_tokens: dict[str, dict] = {}
 
 
 # ------------ УТИЛИТЫ ------------
 
 def check_anomalies(history: deque[tuple[float, float]]):
-    """Возвращает список строк с аномалиями (изменение объёма ≥ 20% на окнах 5s–24h)."""
+    """
+    Возвращает список строк с аномалиями.
+    Теперь в history лежит volume.m5 (объём за 5 минут) в динамике,
+    и мы считаем изменение этого значения на окнах 5s–24h.
+    Порог: |Δ| ≥ 20%.
+    """
     if len(history) < 2:
         return []
 
-    now_ts, last_vol = history[-1]
+    now_ts, last_val = history[-1]
     alerts: list[str] = []
 
     windows = [
@@ -60,19 +65,19 @@ def check_anomalies(history: deque[tuple[float, float]]):
     ]
 
     for label, span in windows:
-        old_vol = None
-        for ts, vol in history:
+        old_val = None
+        for ts, val in history:
             if now_ts - ts >= span:
-                old_vol = vol
+                old_val = val
                 break
 
-        if old_vol is None or old_vol <= 0:
+        if old_val is None or old_val <= 0:
             continue
 
-        change = (last_vol - old_vol) / old_vol * 100
-        if abs(change) >= 1:
+        change = (last_val - old_val) / old_val * 100
+        if abs(change) >= 20:
             direction = "⬆️" if change > 0 else "⬇️"
-            alerts.append(f"{direction} {label}: {change:.1f}% (объём 24h)")
+            alerts.append(f"{direction} {label}: {change:.1f}% (volume.m5)")
 
     return alerts
 
@@ -114,8 +119,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if pair:
         price = pair.get("priceUsd", "N/A")
+
         volume_info = pair.get("volume") or {}
         volume_24h = volume_info.get("h24", 0) or 0
+        volume_m5 = volume_info.get("m5", 0) or 0  # новый, более «живой» объём[web:93]
 
         mcap = pair.get("marketCap") or pair.get("mcap") or 0
         fdv = pair.get("fdv") or 0
@@ -128,6 +135,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💎 {symbol}\n"
             f"💰 Цена: ${price}\n"
             f"📊 Объём 24ч: ${volume_24h:,.0f}\n"
+            f"🕒 Объём 5m: ${volume_m5:,.0f}\n"
             f"🏦 MCAP: ${mcap:,.0f}\n"
             f"🔗 {pair['url']}"
         )
@@ -136,7 +144,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [
                 [
                     InlineKeyboardButton(
-                        "🛰 Следить за объёмом", callback_data=f"track:{address}"
+                        "🛰 Следить за объёмом (m5)", callback_data=f"track:{address}"
                     )
                 ]
             ]
@@ -161,7 +169,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = tracked_tokens.get(address)
         if not info:
             info = {
-                "last_checks": deque(maxlen=500),
+                "last_checks": deque(maxlen=500),  # [(ts, volume_m5)]
                 "last_alert": 0.0,
                 "subscribers": set(),
             }
@@ -171,8 +179,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text(
-            f"✅ Взял {address[:12]}... на контроль объёмов.\n"
-            f"Интервал опроса ~5 секунд, алерты при изменении объёма ≥ 20% "
+            f"✅ Взял {address[:12]}... на контроль объёма m5.\n"
+            f"Интервал опроса ~5 секунд, алерты при изменении volume.m5 ≥ 20% "
             f"на окнах 5s–24h."
         )
 
@@ -233,18 +241,18 @@ async def volume_watcher(app: Application):
                         continue
 
                     volume_info = pair.get("volume") or {}
-                    volume_24h = float(volume_info.get("h24", 0) or 0)
+                    volume_m5 = float(volume_info.get("m5", 0) or 0)
 
                     now_ts = time.time()
                     history: deque = info["last_checks"]
-                    history.append((now_ts, volume_24h))
+                    history.append((now_ts, volume_m5))
 
                     alerts = check_anomalies(history)
 
                     if alerts and now_ts - info["last_alert"] > 30:
                         info["last_alert"] = now_ts
                         symbol = pair["baseToken"]["symbol"]
-                        msg = f"🚨 Аномалия объёма по {symbol}\n" + "\n".join(alerts)
+                        msg = f"🚨 Аномалия объёма (m5) по {symbol}\n" + "\n".join(alerts)
 
                         for uid in list(info["subscribers"]):
                             try:

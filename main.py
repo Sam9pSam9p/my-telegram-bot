@@ -36,9 +36,9 @@ logger = logging.getLogger(__name__)
 # address -> {
 #   "last_checks": deque[(ts, vol_m5, price)],
 #   "last_alert": float,
-#   "subscribers": {
-#       user_id: {"vol_threshold": float | None, "price_threshold": float | None}
-#   }
+#   "subscribers": { user_id: {"vol_threshold": float|None, "price_threshold": float|None} },
+#   "symbol": str | None,
+#   "chain": str | None,
 # }
 tracked_tokens: dict[str, dict] = {}
 
@@ -48,13 +48,48 @@ pending_threshold_input: dict[int, dict] = {}
 
 # ------------ УТИЛИТЫ ------------
 
+def map_chain(chain_id: str | None) -> str:
+    """Простое отображение chainId -> человекочитаемое имя сети.[web:93]"""
+    if not chain_id:
+        return "Unknown"
+    mapping = {
+        "solana": "Solana",
+        "eth": "Ethereum",
+        "ethereum": "Ethereum",
+        "bsc": "BSC",
+        "bnb": "BSC",
+        "base": "Base",
+        "polygon": "Polygon",
+        "arbitrum": "Arbitrum",
+        "optimism": "Optimism",
+        "avax": "Avalanche",
+    }
+    return mapping.get(chain_id.lower(), chain_id)
+
+
+def format_addr_with_meta(address: str, info: dict | None) -> str:
+    """Формат для отображения: адрес (тикер, сеть, пороги)."""
+    symbol = info.get("symbol") if info else None
+    chain = map_chain(info.get("chain")) if info else "Unknown"
+
+    base = address
+    meta = []
+    if symbol:
+        meta.append(symbol)
+    if chain:
+        meta.append(chain)
+    if not meta:
+        return base
+    return f"{base} ({', '.join(meta)})"
+
+
 def check_anomalies_generic(
     history: deque[tuple[float, float]],
-    user_threshold: float,
+    user_threshold: float | None,
     label_suffix: str,
 ):
     """
-    history: [(timestamp, value)]  — либо volume.m5, либо priceUsd.
+    history: [(timestamp, value)] — либо volume.m5, либо priceUsd.
     user_threshold: порог в %.
     label_suffix: подпись, например 'volume.m5' или 'price'.
     """
@@ -99,8 +134,9 @@ def check_anomalies_generic(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Привет! Я твой крипто-бот!\n\n"
-        "💎 Отправь адрес токена (Sol/ETH/Base/BNB):\n"
-        "пример: So11111111111111111111111111111111111111112\n\n"
+        "1) Отправь адрес токена (Sol/ETH/Base/BNB).\n"
+        "2) Нажми кнопку отслеживания объёма или цены.\n"
+        "3) Введи порог в %.\n\n"
         "/price — цена Bitcoin\n"
         "/watchlist — список отслеживаемых\n"
         "/unwatch <адрес> — убрать из отслеживания"
@@ -158,8 +194,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["pending_volume_for"] = None
         pending_threshold_input[user_id] = state
 
+        label = format_addr_with_meta(address, info)
         await update.message.reply_text(
-            f"✅ Установлен порог объёма: {threshold:.1f}%.\n"
+            f"✅ Порог объёма для {label}: {threshold:.1f}%.\n"
             f"Алерты по volume.m5 при изменении ≥ этого значения."
         )
         return
@@ -193,8 +230,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["pending_price_for"] = None
         pending_threshold_input[user_id] = state
 
+        label = format_addr_with_meta(address, info)
         await update.message.reply_text(
-            f"✅ Установлен порог цены: {threshold:.1f}%.\n"
+            f"✅ Порог цены для {label}: {threshold:.1f}%.\n"
             f"Алерты по priceUsd при изменении ≥ этого значения."
         )
         return
@@ -221,9 +259,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mcap = fdv
 
         symbol = pair["baseToken"]["symbol"]
+        chain_id = pair.get("chainId")  # есть в ответе DexScreener[web:93]
+        chain_name = map_chain(chain_id)
+
+        # сохраняем метаданные, если ещё не были
+        info = tracked_tokens.get(address)
+        if not info:
+            info = {
+                "last_checks": deque(maxlen=500),
+                "last_alert": 0.0,
+                "subscribers": {},
+                "symbol": symbol,
+                "chain": chain_id,
+            }
+            tracked_tokens[address] = info
+        else:
+            info.setdefault("symbol", symbol)
+            info.setdefault("chain", chain_id)
 
         text_resp = (
-            f"💎 {symbol}\n"
+            f"💎 {symbol} ({chain_name})\n"
             f"💰 Цена: ${price}\n"
             f"📊 Объём 24ч: ${volume_24h:,.0f}\n"
             f"🕒 Объём 5m: ${volume_m5:,.0f}\n"
@@ -262,7 +317,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data or ""
     user_id = query.from_user.id
 
-    # гарантируем структуру состояния
     state = pending_threshold_input.get(user_id) or {
         "pending_volume_for": None,
         "pending_price_for": None,
@@ -274,9 +328,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = tracked_tokens.get(address)
         if not info:
             info = {
-                "last_checks": deque(maxlen=500),  # [(ts, vol_m5, price)]
+                "last_checks": deque(maxlen=500),
                 "last_alert": 0.0,
                 "subscribers": {},
+                "symbol": None,
+                "chain": None,
             }
             tracked_tokens[address] = info
 
@@ -288,9 +344,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_threshold_input[user_id] = state
 
         await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
         await query.message.reply_text(
-            "📊 Введи процент изменения объёма m5, при котором слать алерт.\n"
-            "Например: 20"
+            f"📊 Введи процент изменения объёма m5 для {label}, при котором слать алерт.\n"
+            f"Например: 20"
         )
 
     elif data.startswith("track_price:"):
@@ -302,6 +359,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "last_checks": deque(maxlen=500),
                 "last_alert": 0.0,
                 "subscribers": {},
+                "symbol": None,
+                "chain": None,
             }
             tracked_tokens[address] = info
 
@@ -313,9 +372,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_threshold_input[user_id] = state
 
         await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
         await query.message.reply_text(
-            "📈 Введи процент изменения цены, при котором слать алерт.\n"
-            "Например: 5"
+            f"📈 Введи процент изменения цены для {label}, при котором слать алерт.\n"
+            f"Например: 5"
         )
 
 
@@ -331,21 +391,24 @@ async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         vt = cfg.get("vol_threshold")
         pt = cfg.get("price_threshold")
+        if vt is None and pt is None:
+            continue
+
         parts = []
         if vt is not None:
             parts.append(f"vol ≥ {vt:.1f}%")
         if pt is not None:
             parts.append(f"price ≥ {pt:.1f}%")
-        if not parts:
-            continue
-        rows.append(f"{address} ({', '.join(parts)})")
+
+        label = format_addr_with_meta(address, info)
+        rows.append(f"{label} ({', '.join(parts)})")
 
     if not rows:
         await update.message.reply_text("👀 Сейчас ты ничего не отслеживаешь.")
         return
 
-    text = "🛰 Ты отслеживаешь:\n" + "\n".join(f"- `{row}`" for row in rows)
-    await update.message.reply_text(text, parse_mode="Markdown")
+    text = "🛰 Ты отслеживаешь:\n" + "\n".join(f"- {row}" for row in rows)
+    await update.message.reply_text(text)
 
 
 async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -373,14 +436,15 @@ async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state["pending_price_for"] = None
         pending_threshold_input[user_id] = state
 
-    await update.message.reply_text(f"✅ Отключил отслеживание для {address[:12]}...")
+    label = format_addr_with_meta(address, info or {})
+    await update.message.reply_text(f"✅ Отключил отслеживание для {label}.")
 
 
 # ------------ ФОНОВЫЙ МОНИТОР ------------
 
-async def volume_watcher(app: Application):
+async def market_watcher(app: Application):
     while True:
-        logger.info("VOLUME_WATCHER_TICK")
+        logger.info("MARKET_WATCHER_TICK")
         if not tracked_tokens:
             await asyncio.sleep(5)
             continue
@@ -404,9 +468,8 @@ async def volume_watcher(app: Application):
                     if not info["subscribers"]:
                         continue
 
-                    symbol = pair["baseToken"]["symbol"]
+                    symbol = info.get("symbol") or pair["baseToken"]["symbol"]
 
-                    # Подготавливаем две истории: для объёма и для цены
                     hist_vol = deque(
                         [(ts, v) for (ts, v, p) in history_full], maxlen=history_full.maxlen
                     )
@@ -436,7 +499,9 @@ async def volume_watcher(app: Application):
                                 parts.append("🚨 Объём:\n" + "\n".join(vol_alerts))
                             if price_alerts:
                                 parts.append("⚡ Цена:\n" + "\n".join(price_alerts))
-                            msg = f"{symbol}\n" + "\n\n".join(parts)
+
+                            label = format_addr_with_meta(address, info)
+                            msg = f"{symbol}\n{label}\n\n" + "\n\n".join(parts)
                             try:
                                 await app.bot.send_message(chat_id=uid, text=msg)
                             except Exception as e:
@@ -448,7 +513,7 @@ async def volume_watcher(app: Application):
 
 
 async def post_init(app: Application):
-    app.create_task(volume_watcher(app))
+    app.create_task(market_watcher(app))
     logger.info("🚀 Market watcher запущен…")
 
 

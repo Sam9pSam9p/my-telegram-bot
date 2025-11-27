@@ -33,16 +33,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# address -> {
-#   "last_checks": deque[(ts, vol_m5, price)],
-#   "last_alert": float,
-#   "subscribers": { user_id: {"vol_threshold": float|None, "price_threshold": float|None} },
-#   "symbol": str | None,
-#   "chain": str | None,
-# }
+# Глобальные переменные
 tracked_tokens: dict[str, dict] = {}
-
-# user_id -> {"pending_volume_for": address | None, "pending_price_for": address | None}
 pending_threshold_input: dict[int, dict] = {}
 
 # ------------ УТИЛИТЫ ------------
@@ -128,8 +120,9 @@ def check_anomalies_generic(
 # ------------ КОМАНДЫ ------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"👋 /start от {update.effective_user.id}")
     await update.message.reply_text(
-        "🤖 Привет! Я твой крипто-бот v2.0!\n\n"
+        "🤖 Привет! Я твой крипто-бот v2.1!\n\n"
         "1) Отправь адрес токена (Sol/ETH/Base/BNB).\n"
         "2) Нажми кнопку отслеживания объёма или цены.\n"
         "3) Введи порог в %.\n\n"
@@ -139,19 +132,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            "https://api.coingecko.com/api/v3/simple/price"
-            "?ids=bitcoin&vs_currencies=usd"
-        ) as resp:
-            data = await resp.json()
-    btc_price = data["bitcoin"]["usd"]
-    await update.message.reply_text(f"₿ Bitcoin: ${btc_price:,}")
+    logger.info(f"₿ /price от {update.effective_user.id}")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.coingecko.com/api/v3/simple/price"
+                "?ids=bitcoin&vs_currencies=usd"
+            ) as resp:
+                data = await resp.json()
+        btc_price = data["bitcoin"]["usd"]
+        await update.message.reply_text(f"₿ Bitcoin: ${btc_price:,}")
+    except Exception as e:
+        logger.error(f"Ошибка /price: {e}")
+        await update.message.reply_text("❌ Ошибка получения цены BTC")
 
 # ------------ ОБРАБОТКА СООБЩЕНИЙ ------------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.info(f"📨 Сообщение от {user_id}: {update.message.text[:50]}")
+    
     text = update.message.text.strip()
 
     state = pending_threshold_input.get(user_id) or {
@@ -233,73 +233,80 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3) Обычный режим: считаем, что это контракт
     address = text
+    logger.info(f"🔍 Анализируем контракт {address[:12]} от {user_id}")
     await update.message.reply_text(f"🔍 Анализирую {address[:12]}...")
 
-    async with aiohttp.ClientSession() as session:
-        raw = await get_token_pairs_by_address(session, address)
+    try:
+        async with aiohttp.ClientSession() as session:
+            raw = await get_token_pairs_by_address(session, address)
 
-    pair = pick_best_pair(raw)
+        pair = pick_best_pair(raw)
 
-    if pair:
-        price = float(pair.get("priceUsd", 0) or 0)
+        if pair:
+            price = float(pair.get("priceUsd", 0) or 0)
 
-        volume_info = pair.get("volume") or {}
-        volume_24h = volume_info.get("h24", 0) or 0
-        volume_m5 = volume_info.get("m5", 0) or 0
+            volume_info = pair.get("volume") or {}
+            volume_24h = float(volume_info.get("h24", 0) or 0)
+            volume_m5 = float(volume_info.get("m5", 0) or 0)
 
-        mcap = pair.get("marketCap") or pair.get("mcap") or 0
-        fdv = pair.get("fdv") or 0
-        if not mcap and fdv:
-            mcap = fdv
+            mcap = float(pair.get("marketCap") or pair.get("mcap") or 0)
+            fdv = float(pair.get("fdv") or 0)
+            if not mcap and fdv:
+                mcap = fdv
 
-        symbol = pair["baseToken"]["symbol"]
-        chain_id = pair.get("chainId")
-        chain_name = map_chain(chain_id)
+            symbol = pair["baseToken"]["symbol"]
+            chain_id = pair.get("chainId")
+            chain_name = map_chain(chain_id)
 
-        # сохраняем метаданные, если ещё не были
-        info = tracked_tokens.get(address)
-        if not info:
-            info = {
-                "last_checks": deque(maxlen=1000),
-                "last_alert": 0.0,
-                "subscribers": {},
-                "symbol": symbol,
-                "chain": chain_id,
-            }
-            tracked_tokens[address] = info
+            # сохраняем метаданные
+            info = tracked_tokens.get(address)
+            if not info:
+                info = {
+                    "last_checks": deque(maxlen=1000),
+                    "last_alert": 0.0,
+                    "subscribers": {},
+                    "symbol": symbol,
+                    "chain": chain_id,
+                }
+                tracked_tokens[address] = info
+            else:
+                info.setdefault("symbol", symbol)
+                info.setdefault("chain", chain_id)
+
+            text_resp = (
+                f"💎 {symbol} ({chain_name})\n"
+                f"💰 Цена: ${price:,.6f}\n"
+                f"📊 Объём 24ч: ${volume_24h:,.0f}\n"
+                f"🕒 Объём 5m: ${volume_m5:,.0f}\n"
+                f"🏦 MCAP: ${mcap:,.0f}\n"
+                f"🔗 {pair['url']}"
+            )
+
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🛰 Следить за объёмом (m5)",
+                            callback_data=f"track_vol:{address}",
+                        ),
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "📈 Следить за ценой",
+                            callback_data=f"track_price:{address}",
+                        )
+                    ],
+                ]
+            )
+
+            await update.message.reply_text(text_resp, reply_markup=keyboard)
+            logger.info(f"✅ Токен {symbol} проанализирован для {user_id}")
         else:
-            info.setdefault("symbol", symbol)
-            info.setdefault("chain", chain_id)
-
-        text_resp = (
-            f"💎 {symbol} ({chain_name})\n"
-            f"💰 Цена: ${price}\n"
-            f"📊 Объём 24ч: ${volume_24h:,.0f}\n"
-            f"🕒 Объём 5m: ${volume_m5:,.0f}\n"
-            f"🏦 MCAP: ${mcap:,.0f}\n"
-            f"🔗 {pair['url']}"
-        )
-
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "🛰 Следить за объёмом (m5)",
-                        callback_data=f"track_vol:{address}",
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "📈 Следить за ценой",
-                        callback_data=f"track_price:{address}",
-                    )
-                ],
-            ]
-        )
-
-        await update.message.reply_text(text_resp, reply_markup=keyboard)
-    else:
-        await update.message.reply_text("❌ Токен не найден. Проверь адрес!")
+            logger.warning(f"❌ Токен не найден: {address}")
+            await update.message.reply_text("❌ Токен не найден. Проверь адрес!")
+    except Exception as e:
+        logger.error(f"💥 Ошибка анализа {address}: {e}")
+        await update.message.reply_text(f"❌ Ошибка анализа: {str(e)}")
 
 # ------------ КНОПКИ ------------
 
@@ -309,6 +316,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data or ""
     user_id = query.from_user.id
+    logger.info(f"🔘 Кнопка от {user_id}: {data}")
 
     state = pending_threshold_input.get(user_id) or {
         "pending_volume_for": None,
@@ -375,6 +383,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.info(f"📋 /watchlist от {user_id}")
 
     rows = []
     for address, info in tracked_tokens.items():
@@ -404,6 +413,8 @@ async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.info(f"🗑 /unwatch от {user_id}")
+    
     if not context.args:
         await update.message.reply_text("Используй: /unwatch <адрес_контракта>")
         return
@@ -430,109 +441,107 @@ async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     label = format_addr_with_meta(address, info or {})
     await update.message.reply_text(f"✅ Отключил отслеживание для {label}.")
 
-# ------------ ФОНОВЫЙ МОНИТОР v2.0 (ИСПРАВЛЕННЫЙ) ------------
-
+# ------------ ФОНОВЫЙ МОНИТОР v2.1 (БЕЗ JobQueue) ------------
 async def market_watcher(app: Application):
-    logger.info("🚀 Market watcher v2.0 запущен с DEBUG логами")
+    logger.info("🚀 Market watcher v2.1 запущен в отдельной задаче")
     
     while True:
-        logger.info(f"⏰ TICK #{int(time.time())} | Токенов: {len(tracked_tokens)}")
-        
-        if not tracked_tokens:
+        try:
+            logger.info(f"⏰ TICK #{int(time.time())} | Токенов: {len(tracked_tokens)}")
+            
+            if not tracked_tokens:
+                await asyncio.sleep(5)
+                continue
+
+            async with aiohttp.ClientSession() as session:
+                for address, info in list(tracked_tokens.items()):
+                    try:
+                        logger.info(f"🔍 Проверяем {address[:8]}... | Subs: {len(info['subscribers'])}")
+                        
+                        raw = await get_token_pairs_by_address(session, address)
+                        pair = pick_best_pair(raw)
+                        
+                        if not pair:
+                            logger.warning(f"❌ Нет пары для {address}")
+                            continue
+
+                        volume_info = pair.get("volume") or {}
+                        volume_m5 = float(volume_info.get("m5", 0) or 0)
+                        price = float(pair.get("priceUsd", 0) or 0)
+                        
+                        logger.info(f"📊 {address[:8]}: vol_m5=${volume_m5:,.0f} | price=${price:.6f}")
+                        
+                        now_ts = time.time()
+                        
+                        history_full: deque = info.setdefault("last_checks", deque(maxlen=1000))
+                        history_full.append((now_ts, volume_m5, price))
+                        
+                        if len(history_full) > 1:
+                            last_ts, last_vol, last_price = history_full[-1]
+                            prev_ts, prev_vol, prev_price = history_full[-2]
+                            logger.info(f"📈 История: vol {last_vol/prev_vol:.1f}x | price {((last_price-prev_price)/prev_price*100):+.1f}%")
+
+                        if not info["subscribers"]:
+                            continue
+
+                        symbol = info.get("symbol") or pair["baseToken"]["symbol"]
+
+                        hist_vol = deque([(ts, v) for (ts, v, p) in history_full], maxlen=200)
+                        hist_price = deque([(ts, p) for (ts, v, p) in history_full], maxlen=200)
+
+                        for uid, cfg in list(info["subscribers"].items()):
+                            vt = cfg.get("vol_threshold")
+                            pt = cfg.get("price_threshold")
+
+                            vol_alerts = check_anomalies_generic(hist_vol, vt, "volume.m5") if vt else []
+                            price_alerts = check_anomalies_generic(hist_price, pt, "price") if pt else []
+
+                            if (vol_alerts or price_alerts) and (time.time() - info.get("last_alert", 0) > 10):
+                                info["last_alert"] = time.time()
+                                
+                                parts = []
+                                if vol_alerts:
+                                    parts.append("🚨 **ОБЪЁМ:**\n" + "\n".join(vol_alerts))
+                                if price_alerts:
+                                    parts.append("⚡ **ЦЕНА:**\n" + "\n".join(price_alerts))
+
+                                label = format_addr_with_meta(address, info)
+                                msg = f"**{symbol}**\n{label}\n\n" + "\n\n".join(parts)
+                                
+                                logger.info(f"🔔 ОТПРАВЛЯЕМ АЛЕРТ {uid}: {msg[:100]}...")
+                                
+                                try:
+                                    await app.bot.send_message(
+                                        chat_id=uid, 
+                                        text=msg, 
+                                        parse_mode='Markdown'
+                                    )
+                                    logger.info(f"✅ Алерт доставлен {uid}")
+                                except Exception as e:
+                                    logger.error(f"❌ Ошибка отправки {uid}: {e}")
+
+                    except Exception as e:
+                        logger.error(f"💥 ОШИБКА {address[:8]}: {e}")
+
+            logger.info("😴 Спим 5 сек...")
             await asyncio.sleep(5)
-            continue
-
-        async with aiohttp.ClientSession() as session:
-            for address, info in list(tracked_tokens.items()):
-                try:
-                    # 🔍 DEBUG: что отслеживаем
-                    logger.info(f"🔍 Проверяем {address[:8]}... | Subs: {len(info['subscribers'])}")
-                    
-                    raw = await get_token_pairs_by_address(session, address)
-                    pair = pick_best_pair(raw)
-                    
-                    if not pair:
-                        logger.warning(f"❌ Нет пары для {address}")
-                        continue
-
-                    # 📊 РЕАЛЬНЫЕ ДАННЫЕ (DEBUG)
-                    volume_info = pair.get("volume") or {}
-                    volume_m5 = float(volume_info.get("m5", 0) or 0)
-                    price = float(pair.get("priceUsd", 0) or 0)
-                    
-                    logger.info(f"📊 {address[:8]}: vol_m5=${volume_m5:,.0f} | price=${price:.6f}")
-                    
-                    now_ts = time.time()
-                    
-                    # ✅ ФИКС 1: БОЛЬШЕ ИСТОРИЯ + ЛУЧШЕЕ НАКОПЛЕНИЕ
-                    history_full: deque = info.setdefault("last_checks", deque(maxlen=1000))
-                    history_full.append((now_ts, volume_m5, price))
-                    
-                    # ✅ ФИКС 2: DEBUG истории
-                    if len(history_full) > 1:
-                        last_ts, last_vol, last_price = history_full[-1]
-                        prev_ts, prev_vol, prev_price = history_full[-2]
-                        logger.info(f"📈 История: vol {last_vol/prev_vol:.1f}x | price {((last_price-prev_price)/prev_price*100):+.1f}%")
-
-                    if not info["subscribers"]:
-                        continue
-
-                    symbol = info.get("symbol") or pair["baseToken"]["symbol"]
-
-                    # ✅ ФИКС 3: ОТДЕЛЬНЫЕ DEQUE ДЛЯ ТОЧНОСТИ
-                    hist_vol = deque([(ts, v) for (ts, v, p) in history_full], maxlen=200)
-                    hist_price = deque([(ts, p) for (ts, v, p) in history_full], maxlen=200)
-
-                    for uid, cfg in list(info["subscribers"].items()):
-                        vt = cfg.get("vol_threshold")
-                        pt = cfg.get("price_threshold")
-
-                        vol_alerts = check_anomalies_generic(hist_vol, vt, "volume.m5") if vt else []
-                        price_alerts = check_anomalies_generic(hist_price, pt, "price") if pt else []
-
-                        # ✅ ФИКС 4: УМНАЯ ДЕДУПЛИКАЦИЯ (10 сек вместо 5)
-                        if (vol_alerts or price_alerts) and (time.time() - info.get("last_alert", 0) > 10):
-                            info["last_alert"] = time.time()
-                            
-                            # 🔔 СТРОИМ СООБЩЕНИЕ
-                            parts = []
-                            if vol_alerts:
-                                parts.append("🚨 **ОБЪЁМ:**\n" + "\n".join(vol_alerts))
-                            if price_alerts:
-                                parts.append("⚡ **ЦЕНА:**\n" + "\n".join(price_alerts))
-
-                            label = format_addr_with_meta(address, info)
-                            msg = f"**{symbol}**\n{label}\n\n" + "\n\n".join(parts)
-                            
-                            logger.info(f"🔔 ОТПРАВЛЯЕМ АЛЕРТ {uid}: {msg[:100]}...")
-                            
-                            try:
-                                await app.bot.send_message(
-                                    chat_id=uid, 
-                                    text=msg, 
-                                    parse_mode='Markdown'
-                                )
-                                logger.info(f"✅ Алерт доставлен {uid}")
-                            except Exception as e:
-                                logger.error(f"❌ Ошибка отправки {uid}: {e}")
-
-                except Exception as e:
-                    logger.error(f"💥 ОШИБКА {address[:8]}: {e}")
-
-        logger.info("😴 Спим 5 сек...")
-        await asyncio.sleep(5)
+        except Exception as e:
+            logger.error(f"💥 КРИТИЧЕСКАЯ ОШИБКА market_watcher: {e}")
+            await asyncio.sleep(10)
 
 async def post_init(app: Application):
-    app.job_queue.run_repeating(market_watcher, interval=5, first=1)
-    logger.info("🚀 Market watcher v2.0 запущен…")
+    """Запускаем market_watcher в фоне БЕЗ JobQueue"""
+    logger.info("🚀 post_init: Запускаем market_watcher в фоне")
+    asyncio.create_task(market_watcher(app))
+    logger.info("🚀 Market watcher v2.1 запущен в фоне!")
 
 # ------------ MAIN ------------
-
 def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN не найден. Проверь переменную в Railway.")
         raise SystemExit("BOT_TOKEN is missing")
 
+    logger.info("🚀 Создаём Application...")
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -540,6 +549,7 @@ def main():
         .build()
     )
 
+    logger.info("🚀 Добавляем хендлеры...")
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("watchlist", watchlist))
@@ -547,8 +557,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
 
-    logger.info("🚀 Бот v2.0 запущен…")
-    app.run_polling()
+    logger.info("🚀 Бот v2.1 полностью готов! Запускаем polling...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()

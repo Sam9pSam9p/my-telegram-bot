@@ -39,21 +39,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.get("pairs"):
         pair = data["pairs"][0]
+
         price = pair.get("priceUsd", "N/A")
-        volume = pair.get("volume", {}).get("h24", 0)
+
+        volume_info = pair.get("volume") or {}
+        volume_24h = volume_info.get("h24", 0) or 0
+
+        # MCAP может быть и в корне пары, и внутри "fullyDilutedValuation" / "fdv"
+        mcap = pair.get("marketCap") or pair.get("mcap") or 0
+        # На некоторых парах MCAP нет — тогда считаем сами, если есть fdv
+        if not mcap:
+            fdv = pair.get("fdv") or 0
+            if fdv:
+                mcap = fdv
+
         symbol = pair["baseToken"]["symbol"]
-        mcap = pair.get("mcap", 0)
 
         text = (
             f"💎 {symbol}\n"
             f"💰 Цена: ${price}\n"
-            f"📊 Объём 24ч: ${volume:,.0f}\n"
+            f"📊 Объём 24ч: ${volume_24h:,.0f}\n"
             f"🏦 MCAP: ${mcap:,.0f}\n"
             f"🔗 {pair['url']}"
         )
         await update.message.reply_text(text)
     else:
         await update.message.reply_text("❌ Токен не найден. Проверь адрес!")
+
 
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):

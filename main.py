@@ -33,18 +33,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# address -> {"last_checks": deque[(ts, vol_m5)], "last_alert": float, "subscribers": set[int]}
+# address -> {
+#   "last_checks": deque[(ts, vol_m5)],
+#   "last_alert": float,
+#   "subscribers": { user_id: {"vol_threshold": float} }
+# }
 tracked_tokens: dict[str, dict] = {}
+
+# user_id -> {"pending_volume_for": address}  (ждём ввода порога)
+pending_threshold_input: dict[int, dict] = {}
 
 
 # ------------ УТИЛИТЫ ------------
 
-def check_anomalies(history: deque[tuple[float, float]]):
+def check_anomalies(
+    history: deque[tuple[float, float]],
+    user_threshold: float,
+):
     """
-    Возвращает список строк с аномалиями.
-    Теперь в history лежит volume.m5 (объём за 5 минут) в динамике,
-    и мы считаем изменение этого значения на окнах 5s–24h.
-    Порог: |Δ| ≥ 20%.
+    Возвращает список строк с аномалиями для конкретного пользователя.
+    history: [(timestamp, volume_m5)]
+    user_threshold: порог в % (например 20.0)
     """
     if len(history) < 2:
         return []
@@ -75,7 +84,7 @@ def check_anomalies(history: deque[tuple[float, float]]):
             continue
 
         change = (last_val - old_val) / old_val * 100
-        if abs(change) >= 20:
+        if abs(change) >= user_threshold:
             direction = "⬆️" if change > 0 else "⬇️"
             alerts.append(f"{direction} {label}: {change:.1f}% (volume.m5)")
 
@@ -106,10 +115,50 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"₿ Bitcoin: ${btc_price:,}")
 
 
-# ------------ ОБРАБОТКА КОНТРАКТА ------------
+# ------------ ОБРАБОТКА КОНТРАКТА (+ ВВОД ПОРОГА) ------------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    address = update.message.text.strip()
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    # 1) Если пользователь сейчас вводит порог для объёма
+    state = pending_threshold_input.get(user_id)
+    if state and state.get("pending_volume_for"):
+        address = state["pending_volume_for"]
+        try:
+            threshold = float(text.replace(",", "."))
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Не понял число. Введи процент, например: 20"
+            )
+            return
+
+        info = tracked_tokens.get(address)
+        if not info or user_id not in info["subscribers"]:
+            await update.message.reply_text(
+                "❌ Похоже, этот контракт уже не отслеживается. "
+                "Нажми кнопку ещё раз, чтобы начать заново."
+            )
+            pending_threshold_input.pop(user_id, None)
+            return
+
+        if threshold <= 0:
+            await update.message.reply_text(
+                "❌ Порог должен быть больше 0. Попробуй ещё раз."
+            )
+            return
+
+        info["subscribers"][user_id]["vol_threshold"] = threshold
+        pending_threshold_input.pop(user_id, None)
+
+        await update.message.reply_text(
+            f"✅ Установлен порог объёма: {threshold:.1f}%.\n"
+            f"Алерты будут при изменении volume.m5 на это значение или больше."
+        )
+        return
+
+    # 2) Обычный режим: считаем, что это контракт
+    address = text
     await update.message.reply_text(f"🔍 Анализирую {address[:12]}...")
 
     async with aiohttp.ClientSession() as session:
@@ -122,7 +171,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         volume_info = pair.get("volume") or {}
         volume_24h = volume_info.get("h24", 0) or 0
-        volume_m5 = volume_info.get("m5", 0) or 0  # новый, более «живой» объём[web:93]
+        volume_m5 = volume_info.get("m5", 0) or 0
 
         mcap = pair.get("marketCap") or pair.get("mcap") or 0
         fdv = pair.get("fdv") or 0
@@ -131,7 +180,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         symbol = pair["baseToken"]["symbol"]
 
-        text = (
+        text_resp = (
             f"💎 {symbol}\n"
             f"💰 Цена: ${price}\n"
             f"📊 Объём 24ч: ${volume_24h:,.0f}\n"
@@ -150,7 +199,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         )
 
-        await update.message.reply_text(text, reply_markup=keyboard)
+        await update.message.reply_text(text_resp, reply_markup=keyboard)
     else:
         await update.message.reply_text("❌ Токен не найден. Проверь адрес!")
 
@@ -171,17 +220,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             info = {
                 "last_checks": deque(maxlen=500),  # [(ts, volume_m5)]
                 "last_alert": 0.0,
-                "subscribers": set(),
+                "subscribers": {},
             }
             tracked_tokens[address] = info
 
-        info["subscribers"].add(user_id)
+        # создаём запись подписчика с дефолтным порогом (перезапишем после ввода)
+        info["subscribers"].setdefault(user_id, {"vol_threshold": 20.0})
+
+        # помечаем, что ждём от юзера порог
+        pending_threshold_input[user_id] = {"pending_volume_for": address}
 
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text(
-            f"✅ Взял {address[:12]}... на контроль объёма m5.\n"
-            f"Интервал опроса ~5 секунд, алерты при изменении volume.m5 ≥ 20% "
-            f"на окнах 5s–24h."
+            "📊 Введи процент изменения объёма m5, при котором слать алерт.\n"
+            "Например: 20"
         )
 
 
@@ -193,13 +245,14 @@ async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_tokens = []
     for address, info in tracked_tokens.items():
         if user_id in info["subscribers"]:
-            user_tokens.append(address)
+            thr = info["subscribers"][user_id]["vol_threshold"]
+            user_tokens.append(f"{address} (vol ≥ {thr:.1f}%)")
 
     if not user_tokens:
         await update.message.reply_text("👀 Сейчас ты ничего не отслеживаешь.")
         return
 
-    text = "🛰 Ты отслеживаешь:\n" + "\n".join(f"- `{addr}`" for addr in user_tokens)
+    text = "🛰 Ты отслеживаешь:\n" + "\n".join(f"- `{row}`" for row in user_tokens)
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
@@ -216,9 +269,11 @@ async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Этот адрес ты сейчас не отслеживаешь.")
         return
 
-    info["subscribers"].discard(user_id)
+    info["subscribers"].pop(user_id, None)
     if not info["subscribers"]:
         tracked_tokens.pop(address, None)
+
+    pending_threshold_input.pop(user_id, None)
 
     await update.message.reply_text(f"✅ Отключил отслеживание для {address[:12]}...")
 
@@ -247,14 +302,22 @@ async def volume_watcher(app: Application):
                     history: deque = info["last_checks"]
                     history.append((now_ts, volume_m5))
 
-                    alerts = check_anomalies(history)
+                    if not info["subscribers"]:
+                        continue
 
-                    if alerts and now_ts - info["last_alert"] > 30:
-                        info["last_alert"] = now_ts
-                        symbol = pair["baseToken"]["symbol"]
-                        msg = f"🚨 Аномалия объёма (m5) по {symbol}\n" + "\n".join(alerts)
+                    symbol = pair["baseToken"]["symbol"]
 
-                        for uid in list(info["subscribers"]):
+                    # для каждого подписчика применяем его порог
+                    for uid, cfg in list(info["subscribers"].items()):
+                        threshold = cfg.get("vol_threshold", 20.0)
+                        alerts = check_anomalies(history, threshold)
+
+                        if alerts and now_ts - info["last_alert"] > 5:
+                            info["last_alert"] = now_ts
+                            msg = (
+                                f"🚨 Аномалия объёма (m5) по {symbol}\n"
+                                + "\n".join(alerts)
+                            )
                             try:
                                 await app.bot.send_message(chat_id=uid, text=msg)
                             except Exception as e:

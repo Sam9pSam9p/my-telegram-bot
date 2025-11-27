@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import asyncio
 from collections import deque
 
 import aiohttp
@@ -24,7 +25,6 @@ from dexscreener_service import (
 )
 
 # ------------ НАСТРОЙКИ ------------
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 logging.basicConfig(
@@ -45,11 +45,10 @@ tracked_tokens: dict[str, dict] = {}
 # user_id -> {"pending_volume_for": address | None, "pending_price_for": address | None}
 pending_threshold_input: dict[int, dict] = {}
 
-
 # ------------ УТИЛИТЫ ------------
 
 def map_chain(chain_id: str | None) -> str:
-    """Простое отображение chainId -> человекочитаемое имя сети.[web:93]"""
+    """Простое отображение chainId -> человекочитаемое имя сети."""
     if not chain_id:
         return "Unknown"
     mapping = {
@@ -66,7 +65,6 @@ def map_chain(chain_id: str | None) -> str:
     }
     return mapping.get(chain_id.lower(), chain_id)
 
-
 def format_addr_with_meta(address: str, info: dict | None) -> str:
     """Формат для отображения: адрес (тикер, сеть, пороги)."""
     symbol = info.get("symbol") if info else None
@@ -81,7 +79,6 @@ def format_addr_with_meta(address: str, info: dict | None) -> str:
     if not meta:
         return base
     return f"{base} ({', '.join(meta)})"
-
 
 def check_anomalies_generic(
     history: deque[tuple[float, float]],
@@ -128,12 +125,11 @@ def check_anomalies_generic(
 
     return alerts
 
-
 # ------------ КОМАНДЫ ------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 Привет! Я твой крипто-бот!\n\n"
+        "🤖 Привет! Я твой крипто-бот v2.0!\n\n"
         "1) Отправь адрес токена (Sol/ETH/Base/BNB).\n"
         "2) Нажми кнопку отслеживания объёма или цены.\n"
         "3) Введи порог в %.\n\n"
@@ -141,7 +137,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/watchlist — список отслеживаемых\n"
         "/unwatch <адрес> — убрать из отслеживания"
     )
-
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with aiohttp.ClientSession() as session:
@@ -152,7 +147,6 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data = await resp.json()
     btc_price = data["bitcoin"]["usd"]
     await update.message.reply_text(f"₿ Bitcoin: ${btc_price:,}")
-
 
 # ------------ ОБРАБОТКА СООБЩЕНИЙ ------------
 
@@ -259,14 +253,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mcap = fdv
 
         symbol = pair["baseToken"]["symbol"]
-        chain_id = pair.get("chainId")  # есть в ответе DexScreener[web:93]
+        chain_id = pair.get("chainId")
         chain_name = map_chain(chain_id)
 
         # сохраняем метаданные, если ещё не были
         info = tracked_tokens.get(address)
         if not info:
             info = {
-                "last_checks": deque(maxlen=500),
+                "last_checks": deque(maxlen=1000),
                 "last_alert": 0.0,
                 "subscribers": {},
                 "symbol": symbol,
@@ -307,7 +301,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Токен не найден. Проверь адрес!")
 
-
 # ------------ КНОПКИ ------------
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -328,7 +321,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = tracked_tokens.get(address)
         if not info:
             info = {
-                "last_checks": deque(maxlen=500),
+                "last_checks": deque(maxlen=1000),
                 "last_alert": 0.0,
                 "subscribers": {},
                 "symbol": None,
@@ -356,7 +349,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = tracked_tokens.get(address)
         if not info:
             info = {
-                "last_checks": deque(maxlen=500),
+                "last_checks": deque(maxlen=1000),
                 "last_alert": 0.0,
                 "subscribers": {},
                 "symbol": None,
@@ -377,7 +370,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📈 Введи процент изменения цены для {label}, при котором слать алерт.\n"
             f"Например: 5"
         )
-
 
 # ------------ СПИСОК / ОТКЛЮЧЕНИЕ ------------
 
@@ -410,7 +402,6 @@ async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "🛰 Ты отслеживаешь:\n" + "\n".join(f"- {row}" for row in rows)
     await update.message.reply_text(text)
 
-
 async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not context.args:
@@ -439,12 +430,14 @@ async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     label = format_addr_with_meta(address, info or {})
     await update.message.reply_text(f"✅ Отключил отслеживание для {label}.")
 
-
-# ------------ ФОНОВЫЙ МОНИТОР ------------
+# ------------ ФОНОВЫЙ МОНИТОР v2.0 (ИСПРАВЛЕННЫЙ) ------------
 
 async def market_watcher(app: Application):
+    logger.info("🚀 Market watcher v2.0 запущен с DEBUG логами")
+    
     while True:
-        logger.info("MARKET_WATCHER_TICK")
+        logger.info(f"⏰ TICK #{int(time.time())} | Токенов: {len(tracked_tokens)}")
+        
         if not tracked_tokens:
             await asyncio.sleep(5)
             continue
@@ -452,70 +445,86 @@ async def market_watcher(app: Application):
         async with aiohttp.ClientSession() as session:
             for address, info in list(tracked_tokens.items()):
                 try:
+                    # 🔍 DEBUG: что отслеживаем
+                    logger.info(f"🔍 Проверяем {address[:8]}... | Subs: {len(info['subscribers'])}")
+                    
                     raw = await get_token_pairs_by_address(session, address)
                     pair = pick_best_pair(raw)
+                    
                     if not pair:
+                        logger.warning(f"❌ Нет пары для {address}")
                         continue
 
+                    # 📊 РЕАЛЬНЫЕ ДАННЫЕ (DEBUG)
                     volume_info = pair.get("volume") or {}
                     volume_m5 = float(volume_info.get("m5", 0) or 0)
                     price = float(pair.get("priceUsd", 0) or 0)
-
+                    
+                    logger.info(f"📊 {address[:8]}: vol_m5=${volume_m5:,.0f} | price=${price:.6f}")
+                    
                     now_ts = time.time()
-                    history_full: deque = info["last_checks"]
+                    
+                    # ✅ ФИКС 1: БОЛЬШЕ ИСТОРИЯ + ЛУЧШЕЕ НАКОПЛЕНИЕ
+                    history_full: deque = info.setdefault("last_checks", deque(maxlen=1000))
                     history_full.append((now_ts, volume_m5, price))
+                    
+                    # ✅ ФИКС 2: DEBUG истории
+                    if len(history_full) > 1:
+                        last_ts, last_vol, last_price = history_full[-1]
+                        prev_ts, prev_vol, prev_price = history_full[-2]
+                        logger.info(f"📈 История: vol {last_vol/prev_vol:.1f}x | price {((last_price-prev_price)/prev_price*100):+.1f}%")
 
                     if not info["subscribers"]:
                         continue
 
                     symbol = info.get("symbol") or pair["baseToken"]["symbol"]
 
-                    hist_vol = deque(
-                        [(ts, v) for (ts, v, p) in history_full], maxlen=history_full.maxlen
-                    )
-                    hist_price = deque(
-                        [(ts, p) for (ts, v, p) in history_full], maxlen=history_full.maxlen
-                    )
+                    # ✅ ФИКС 3: ОТДЕЛЬНЫЕ DEQUE ДЛЯ ТОЧНОСТИ
+                    hist_vol = deque([(ts, v) for (ts, v, p) in history_full], maxlen=200)
+                    hist_price = deque([(ts, p) for (ts, v, p) in history_full], maxlen=200)
 
                     for uid, cfg in list(info["subscribers"].items()):
                         vt = cfg.get("vol_threshold")
                         pt = cfg.get("price_threshold")
 
-                        vol_alerts = (
-                            check_anomalies_generic(hist_vol, vt, "volume.m5")
-                            if vt is not None
-                            else []
-                        )
-                        price_alerts = (
-                            check_anomalies_generic(hist_price, pt, "price")
-                            if pt is not None
-                            else []
-                        )
+                        vol_alerts = check_anomalies_generic(hist_vol, vt, "volume.m5") if vt else []
+                        price_alerts = check_anomalies_generic(hist_price, pt, "price") if pt else []
 
-                        if (vol_alerts or price_alerts) and time.time() - info["last_alert"] > 5:
+                        # ✅ ФИКС 4: УМНАЯ ДЕДУПЛИКАЦИЯ (10 сек вместо 5)
+                        if (vol_alerts or price_alerts) and (time.time() - info.get("last_alert", 0) > 10):
                             info["last_alert"] = time.time()
+                            
+                            # 🔔 СТРОИМ СООБЩЕНИЕ
                             parts = []
                             if vol_alerts:
-                                parts.append("🚨 Объём:\n" + "\n".join(vol_alerts))
+                                parts.append("🚨 **ОБЪЁМ:**\n" + "\n".join(vol_alerts))
                             if price_alerts:
-                                parts.append("⚡ Цена:\n" + "\n".join(price_alerts))
+                                parts.append("⚡ **ЦЕНА:**\n" + "\n".join(price_alerts))
 
                             label = format_addr_with_meta(address, info)
-                            msg = f"{symbol}\n{label}\n\n" + "\n\n".join(parts)
+                            msg = f"**{symbol}**\n{label}\n\n" + "\n\n".join(parts)
+                            
+                            logger.info(f"🔔 ОТПРАВЛЯЕМ АЛЕРТ {uid}: {msg[:100]}...")
+                            
                             try:
-                                await app.bot.send_message(chat_id=uid, text=msg)
+                                await app.bot.send_message(
+                                    chat_id=uid, 
+                                    text=msg, 
+                                    parse_mode='Markdown'
+                                )
+                                logger.info(f"✅ Алерт доставлен {uid}")
                             except Exception as e:
-                                logger.warning(f"Send alert error: {e}")
-                except Exception as e:
-                    logger.warning(f"Market watcher error for {address}: {e}")
+                                logger.error(f"❌ Ошибка отправки {uid}: {e}")
 
+                except Exception as e:
+                    logger.error(f"💥 ОШИБКА {address[:8]}: {e}")
+
+        logger.info("😴 Спим 5 сек...")
         await asyncio.sleep(5)
 
-
 async def post_init(app: Application):
-    app.create_task(market_watcher(app))
-    logger.info("🚀 Market watcher запущен…")
-
+    app.job_queue.run_repeating(market_watcher, interval=5, first=1)
+    logger.info("🚀 Market watcher v2.0 запущен…")
 
 # ------------ MAIN ------------
 
@@ -538,9 +547,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
 
-    logger.info("🚀 Бот запущен…")
+    logger.info("🚀 Бот v2.0 запущен…")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()

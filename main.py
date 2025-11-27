@@ -18,7 +18,6 @@ from telegram.ext import (
     filters,
 )
 
-
 from dexscreener_service import (
     get_token_pairs_by_address,
     pick_best_pair,
@@ -71,7 +70,7 @@ def check_anomalies(history: deque[tuple[float, float]]):
             continue
 
         change = (last_vol - old_vol) / old_vol * 100
-        if abs(change) >= 20:
+        if abs(change) >= 1:
             direction = "⬆️" if change > 0 else "⬇️"
             alerts.append(f"{direction} {label}: {change:.1f}% (объём 24h)")
 
@@ -85,7 +84,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 Привет! Я твой крипто-бот!\n\n"
         "💎 Отправь адрес токена (Sol/ETH/Base/BNB):\n"
         "пример: So11111111111111111111111111111111111111112\n\n"
-        "/price — цена Bitcoin"
+        "/price — цена Bitcoin\n"
+        "/watchlist — список отслеживаемых\n"
+        "/unwatch <адрес> — убрать из отслеживания"
     )
 
 
@@ -176,17 +177,49 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ------------ СПИСОК / ОТКЛЮЧЕНИЕ ------------
+
+async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    user_tokens = []
+    for address, info in tracked_tokens.items():
+        if user_id in info["subscribers"]:
+            user_tokens.append(address)
+
+    if not user_tokens:
+        await update.message.reply_text("👀 Сейчас ты ничего не отслеживаешь.")
+        return
+
+    text = "🛰 Ты отслеживаешь:\n" + "\n".join(f"- `{addr}`" for addr in user_tokens)
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text("Используй: /unwatch <адрес_контракта>")
+        return
+
+    address = context.args[0].strip()
+
+    info = tracked_tokens.get(address)
+    if not info or user_id not in info["subscribers"]:
+        await update.message.reply_text("❌ Этот адрес ты сейчас не отслеживаешь.")
+        return
+
+    info["subscribers"].discard(user_id)
+    if not info["subscribers"]:
+        tracked_tokens.pop(address, None)
+
+    await update.message.reply_text(f"✅ Отключил отслеживание для {address[:12]}...")
+
+
 # ------------ ФОНОВЫЙ МОНИТОР ------------
 
 async def volume_watcher(app: Application):
     while True:
-        async def volume_watcher(app: Application):
-    while True:
         logger.info("VOLUME_WATCHER_TICK")
-        if not tracked_tokens:
-            await asyncio.sleep(5)
-            continue
-
         if not tracked_tokens:
             await asyncio.sleep(5)
             continue
@@ -225,7 +258,6 @@ async def volume_watcher(app: Application):
 
 
 async def post_init(app: Application):
-    """Хук, который вызывается после старта приложения — тут поднимаем вочер."""
     app.create_task(volume_watcher(app))
     logger.info("🚀 Volume watcher запущен…")
 
@@ -238,15 +270,16 @@ def main():
         raise SystemExit("BOT_TOKEN is missing")
 
     app = (
-    Application.builder()
-    .token(BOT_TOKEN)
-    .post_init(post_init)
-    .build()
-)
-
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("price", price))
+    app.add_handler(CommandHandler("watchlist", watchlist))
+    app.add_handler(CommandHandler("unwatch", unwatch))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
 

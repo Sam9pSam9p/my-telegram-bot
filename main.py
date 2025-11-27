@@ -180,6 +180,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def volume_watcher(app: Application):
     while True:
+        async def volume_watcher(app: Application):
+    while True:
+        logger.info("VOLUME_WATCHER_TICK")
+        if not tracked_tokens:
+            await asyncio.sleep(5)
+            continue
+
         if not tracked_tokens:
             await asyncio.sleep(5)
             continue

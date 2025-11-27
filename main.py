@@ -11,7 +11,6 @@ from telegram.ext import (
     filters,
 )
 
-# Берём токен из переменной окружения Railway
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 logging.basicConfig(
@@ -24,15 +23,13 @@ logger = logging.getLogger(__name__)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Привет! Я твой крипто-бот!\n\n"
-        "💎 Отправь адрес токена (Sol/ETH/Base/BNB):\n"
-        "пример: So11111111111111111111111111111111111111112\n\n"
-        "/price — покажу цену Bitcoin"
+        "💎 Отправь адрес токена (Sol/ETH/Base/BNB)\n"
+        "/price — цена Bitcoin"
     )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     address = update.message.text.strip()
-
     await update.message.reply_text(f"🔍 Анализирую {address[:12]}...")
 
     async with aiohttp.ClientSession() as session:
@@ -51,7 +48,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💎 {symbol}\n"
             f"💰 Цена: ${price}\n"
             f"📊 Объём 24ч: ${volume:,.0f}\n"
-            f"🏦 Market Cap: ${mcap:,.0f}\n"
+            f"🏦 MCAP: ${mcap:,.0f}\n"
             f"🔗 {pair['url']}"
         )
         await update.message.reply_text(text)
@@ -72,19 +69,19 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN не найден. Проверь переменные Railway.")
+        logger.error("BOT_TOKEN не найден. Проверь переменную в Railway.")
         raise SystemExit("BOT_TOKEN is missing")
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("price", price))
-    application.add_handler(
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("price", price))
+    app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
 
     logger.info("🚀 Бот запущен (polling)…")
-    application.run_polling()
+    app.run_polling()
 
 
 if __name__ == "__main__":

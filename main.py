@@ -1753,6 +1753,51 @@ async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "🛰 **Твой Watchlist:**\n\nНажми на токен для управления:"
     await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
+
+async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удалить токен из watchlist"""
+    user_id = update.effective_user.id
+
+    if not context.args:
+        await update.message.reply_text(
+            "Используй: /unwatch <адрес_контракта>",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    address = context.args[0].strip()
+
+    info = tracked_tokens.get(address)
+    if not info or user_id not in info.get("subscribers", {}):
+        await update.message.reply_text(
+            "❌ Этот адрес ты сейчас не отслеживаешь.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    info["subscribers"].pop(user_id, None)
+
+    if not info["subscribers"]:
+        tracked_tokens.pop(address, None)
+
+    state = pending_threshold_input.get(user_id)
+    if state:
+        if state.get("pending_volume_for") == address:
+            state["pending_volume_for"] = None
+        if state.get("pending_price_for") == address:
+            state["pending_price_for"] = None
+        if state.get("pending_mcap_for") == address:
+            state["pending_mcap_for"] = None
+        if state.get("pending_multi") == address:
+            state["pending_multi"] = None
+        pending_threshold_input[user_id] = state
+
+    label = format_addr_with_meta(address, info or {})
+    await update.message.reply_text(
+        f"✅ Отключил отслеживание для {label}.",
+        reply_markup=main_menu_keyboard(),
+    )
+
 # ============ ФОНОВЫЙ МОНИТОР ============
 
 def analyze_volume_windows(history: deque, current_ts: float) -> dict:

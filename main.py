@@ -2,7 +2,6 @@ import os
 import time
 import logging
 import asyncio
-from collections import deque
 
 import aiohttp
 from telegram import (
@@ -25,6 +24,7 @@ from dexscreener_service import (
 )
 
 # ------------ НАСТРОЙКИ ------------
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 logging.basicConfig(
@@ -33,14 +33,34 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Глобальные переменные
+# tracked_tokens[address] = {
+#   "symbol": str | None,
+#   "chain": str | None,
+#   "subscribers": {
+#       user_id: {
+#           "vol_threshold": float | None,
+#           "price_threshold": float | None,
+#           "mcap_threshold": float | None,
+#           "last_price": float | None,
+#           "last_volume_m5": float | None,
+#           "last_mcap": float | None,
+#           "last_ts": float | None,
+#       }
+#   }
+# }
 tracked_tokens: dict[str, dict] = {}
+
+# pending_threshold_input[user_id] = {
+#   "pending_volume_for": address | None,
+#   "pending_price_for": address | None,
+#   "pending_mcap_for": address | None,
+# }
 pending_threshold_input: dict[int, dict] = {}
+
 
 # ------------ УТИЛИТЫ ------------
 
 def map_chain(chain_id: str | None) -> str:
-    """Простое отображение chainId -> человекочитаемое имя сети."""
     if not chain_id:
         return "Unknown"
     mapping = {
@@ -57,11 +77,10 @@ def map_chain(chain_id: str | None) -> str:
     }
     return mapping.get(chain_id.lower(), chain_id)
 
+
 def format_addr_with_meta(address: str, info: dict | None) -> str:
-    """Формат для отображения: адрес (тикер, сеть, пороги)."""
     symbol = info.get("symbol") if info else None
     chain = map_chain(info.get("chain")) if info else "Unknown"
-
     base = address
     meta = []
     if symbol:
@@ -72,67 +91,51 @@ def format_addr_with_meta(address: str, info: dict | None) -> str:
         return base
     return f"{base} ({', '.join(meta)})"
 
-def check_anomalies_generic(
-    history: deque[tuple[float, float]],
-    user_threshold: float | None,
-    label_suffix: str,
-):
-    """
-    history: [(timestamp, value)] — либо volume.m5, либо priceUsd.
-    user_threshold: порог в %.
-    label_suffix: подпись, например 'volume.m5' или 'price'.
-    """
-    if len(history) < 2 or user_threshold is None:
-        return []
 
-    now_ts, last_val = history[-1]
-    alerts: list[str] = []
+def pct_change(new: float | None, old: float | None) -> float | None:
+    if new is None or old is None or old == 0:
+        return None
+    return (new - old) / old * 100.0
 
-    windows = [
-        ("5s", 5),
-        ("15s", 15),
-        ("30s", 30),
-        ("60s", 60),
-        ("5m", 5 * 60),
-        ("15m", 15 * 60),
-        ("1h", 60 * 60),
-        ("4h", 4 * 60 * 60),
-        ("24h", 24 * 60 * 60),
-    ]
 
-    for label, span in windows:
-        old_val = None
-        for ts, val in history:
-            if now_ts - ts >= span:
-                old_val = val
-                break
+def ensure_subscriber(info: dict, user_id: int) -> dict:
+    subs = info.setdefault("subscribers", {})
+    sub = subs.get(user_id)
+    if not sub:
+        sub = {
+            "vol_threshold": None,
+            "price_threshold": None,
+            "mcap_threshold": None,
+            "last_price": None,
+            "last_volume_m5": None,
+            "last_mcap": None,
+            "last_ts": None,
+        }
+        subs[user_id] = sub
+    return sub
 
-        if old_val is None or old_val <= 0:
-            continue
-
-        change = (last_val - old_val) / old_val * 100
-        if abs(change) >= user_threshold:
-            direction = "⬆️" if change > 0 else "⬇️"
-            alerts.append(f"{direction} {label}: {change:.1f}% ({label_suffix})")
-
-    return alerts
 
 # ------------ КОМАНДЫ ------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"👋 /start от {update.effective_user.id}")
+    logger.info(f"/start от {update.effective_user.id}")
     await update.message.reply_text(
-        "🤖 Привет! Я твой крипто-бот v2.1!\n\n"
+        "🤖 Привет! Я крипто-бот.\n\n"
         "1) Отправь адрес токена (Sol/ETH/Base/BNB).\n"
-        "2) Нажми кнопку отслеживания объёма или цены.\n"
+        "2) Нажми кнопку отслеживания цены / объёма / капы.\n"
         "3) Введи порог в %.\n\n"
-        "/price — цена Bitcoin\n"
-        "/watchlist — список отслеживаемых\n"
-        "/unwatch <адрес> — убрать из отслеживания"
+        "При срабатывании порога бот присылает:\n"
+        "- фактические цену, объём m5 и капитализацию;\n"
+        "- процент изменения каждого параметра от предыдущего состояния.\n\n"
+        "В алерте будут кнопки отключения: цены, капы, объёма или всего сразу.\n\n"
+        "/watchlist — текущие подписки\n"
+        "/unwatch <адрес> — убрать токен\n"
+        "/price — цена BTC"
     )
 
+
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"₿ /price от {update.effective_user.id}")
+    logger.info(f"/price от {update.effective_user.id}")
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -146,261 +149,314 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка /price: {e}")
         await update.message.reply_text("❌ Ошибка получения цены BTC")
 
+
 # ------------ ОБРАБОТКА СООБЩЕНИЙ ------------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logger.info(f"📨 Сообщение от {user_id}: {update.message.text[:50]}")
-    
-    text = update.message.text.strip()
+    text = (update.message.text or "").strip()
+    logger.info(f"MSG от {user_id}: {text[:80]}")
 
     state = pending_threshold_input.get(user_id) or {
         "pending_volume_for": None,
         "pending_price_for": None,
+        "pending_mcap_for": None,
     }
 
-    # 1) Ввод порога объёма
+    # Ввод порога объёма
     if state.get("pending_volume_for"):
         address = state["pending_volume_for"]
         try:
             threshold = float(text.replace(",", "."))
         except ValueError:
-            await update.message.reply_text(
-                "❌ Не понял число. Введи процент для объёма, например: 20"
-            )
+            await update.message.reply_text("❌ Не понял число. Введи %, например: 20")
             return
 
         info = tracked_tokens.get(address)
-        if not info or user_id not in info["subscribers"]:
-            await update.message.reply_text(
-                "❌ Этот контракт уже не отслеживается. Нажми кнопку ещё раз."
-            )
+        if not info:
+            await update.message.reply_text("❌ Этот контракт уже не отслеживается.")
             pending_threshold_input.pop(user_id, None)
             return
 
+        sub = ensure_subscriber(info, user_id)
+
         if threshold <= 0:
-            await update.message.reply_text(
-                "❌ Порог должен быть больше 0. Попробуй ещё раз."
-            )
+            await update.message.reply_text("❌ Порог должен быть > 0.")
             return
 
-        info["subscribers"][user_id]["vol_threshold"] = threshold
+        sub["vol_threshold"] = threshold
         state["pending_volume_for"] = None
         pending_threshold_input[user_id] = state
 
         label = format_addr_with_meta(address, info)
         await update.message.reply_text(
             f"✅ Порог объёма для {label}: {threshold:.1f}%.\n"
-            f"Алерты по volume.m5 при изменении ≥ этого значения."
+            f"Бот будет слать сигнал при изменении m5 volume ≥ этого порога."
         )
         return
 
-    # 2) Ввод порога цены
+    # Ввод порога цены
     if state.get("pending_price_for"):
         address = state["pending_price_for"]
         try:
             threshold = float(text.replace(",", "."))
         except ValueError:
-            await update.message.reply_text(
-                "❌ Не понял число. Введи процент для цены, например: 5"
-            )
+            await update.message.reply_text("❌ Не понял число. Введи %, например: 5")
             return
 
         info = tracked_tokens.get(address)
-        if not info or user_id not in info["subscribers"]:
-            await update.message.reply_text(
-                "❌ Этот контракт уже не отслеживается. Нажми кнопку ещё раз."
-            )
+        if not info:
+            await update.message.reply_text("❌ Этот контракт уже не отслеживается.")
             pending_threshold_input.pop(user_id, None)
             return
 
+        sub = ensure_subscriber(info, user_id)
+
         if threshold <= 0:
-            await update.message.reply_text(
-                "❌ Порог должен быть больше 0. Попробуй ещё раз."
-            )
+            await update.message.reply_text("❌ Порог должен быть > 0.")
             return
 
-        info["subscribers"][user_id]["price_threshold"] = threshold
+        sub["price_threshold"] = threshold
         state["pending_price_for"] = None
         pending_threshold_input[user_id] = state
 
         label = format_addr_with_meta(address, info)
         await update.message.reply_text(
             f"✅ Порог цены для {label}: {threshold:.1f}%.\n"
-            f"Алерты по priceUsd при изменении ≥ этого значения."
+            f"Приоритетный сигнал: изменение цены относительно предыдущего состояния."
         )
         return
 
-    # 3) Обычный режим: считаем, что это контракт
+    # Ввод порога капитализации
+    if state.get("pending_mcap_for"):
+        address = state["pending_mcap_for"]
+        try:
+            threshold = float(text.replace(",", "."))
+        except ValueError:
+            await update.message.reply_text("❌ Не понял число. Введи %, например: 10")
+            return
+
+        info = tracked_tokens.get(address)
+        if not info:
+            await update.message.reply_text("❌ Этот контракт уже не отслеживается.")
+            pending_threshold_input.pop(user_id, None)
+            return
+
+        sub = ensure_subscriber(info, user_id)
+
+        if threshold <= 0:
+            await update.message.reply_text("❌ Порог должен быть > 0.")
+            return
+
+        sub["mcap_threshold"] = threshold
+        state["pending_mcap_for"] = None
+        pending_threshold_input[user_id] = state
+
+        label = format_addr_with_meta(address, info)
+        await update.message.reply_text(
+            f"✅ Порог капитализации для {label}: {threshold:.1f}%.\n"
+            f"Приоритетный сигнал: изменение капитализации относительно предыдущего состояния."
+        )
+        return
+
+    # Если это не ввод порога — считаем, что адрес контракта
     address = text
-    logger.info(f"🔍 Анализируем контракт {address[:12]} от {user_id}")
     await update.message.reply_text(f"🔍 Анализирую {address[:12]}...")
 
     try:
         async with aiohttp.ClientSession() as session:
             raw = await get_token_pairs_by_address(session, address)
-
         pair = pick_best_pair(raw)
-
-        if pair:
-            price = float(pair.get("priceUsd", 0) or 0)
-
-            volume_info = pair.get("volume") or {}
-            volume_24h = float(volume_info.get("h24", 0) or 0)
-            volume_m5 = float(volume_info.get("m5", 0) or 0)
-
-            mcap = float(pair.get("marketCap") or pair.get("mcap") or 0)
-            fdv = float(pair.get("fdv") or 0)
-            if not mcap and fdv:
-                mcap = fdv
-
-            symbol = pair["baseToken"]["symbol"]
-            chain_id = pair.get("chainId")
-            chain_name = map_chain(chain_id)
-
-            # сохраняем метаданные
-            info = tracked_tokens.get(address)
-            if not info:
-                info = {
-                    "last_checks": deque(maxlen=1000),
-                    "last_alert": 0.0,
-                    "subscribers": {},
-                    "symbol": symbol,
-                    "chain": chain_id,
-                }
-                tracked_tokens[address] = info
-            else:
-                info.setdefault("symbol", symbol)
-                info.setdefault("chain", chain_id)
-
-            text_resp = (
-                f"💎 {symbol} ({chain_name})\n"
-                f"💰 Цена: ${price:,.6f}\n"
-                f"📊 Объём 24ч: ${volume_24h:,.0f}\n"
-                f"🕒 Объём 5m: ${volume_m5:,.0f}\n"
-                f"🏦 MCAP: ${mcap:,.0f}\n"
-                f"🔗 {pair['url']}"
-            )
-
-            keyboard = InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "🛰 Следить за объёмом (m5)",
-                            callback_data=f"track_vol:{address}",
-                        ),
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "📈 Следить за ценой",
-                            callback_data=f"track_price:{address}",
-                        )
-                    ],
-                ]
-            )
-
-            await update.message.reply_text(text_resp, reply_markup=keyboard)
-            logger.info(f"✅ Токен {symbol} проанализирован для {user_id}")
-        else:
-            logger.warning(f"❌ Токен не найден: {address}")
-            await update.message.reply_text("❌ Токен не найден. Проверь адрес!")
     except Exception as e:
-        logger.error(f"💥 Ошибка анализа {address}: {e}")
-        await update.message.reply_text(f"❌ Ошибка анализа: {str(e)}")
+        logger.error(f"Ошибка запроса токена {address}: {e}")
+        await update.message.reply_text("❌ Ошибка запроса токена.")
+        return
+
+    if not pair:
+        await update.message.reply_text("❌ Токен не найден. Проверь адрес!")
+        return
+
+    price_cur = float(pair.get("priceUsd", 0) or 0)
+    volume_info = pair.get("volume") or {}
+    vol_m5_cur = float(volume_info.get("m5", 0) or 0)
+    vol_24h_cur = float(volume_info.get("h24", 0) or 0)
+    mcap_cur = float(pair.get("marketCap") or pair.get("mcap") or 0)
+    fdv = float(pair.get("fdv") or 0)
+    if not mcap_cur and fdv:
+        mcap_cur = fdv
+
+    symbol = pair["baseToken"]["symbol"]
+    chain_id = pair.get("chainId")
+    chain_name = map_chain(chain_id)
+
+    info = tracked_tokens.get(address)
+    if not info:
+        info = {
+            "symbol": symbol,
+            "chain": chain_id,
+            "subscribers": {},
+        }
+        tracked_tokens[address] = info
+    else:
+        info.setdefault("symbol", symbol)
+        info.setdefault("chain", chain_id)
+        info.setdefault("subscribers", {})
+
+    text_resp = (
+        f"💎 {symbol} ({chain_name})\n"
+        f"💰 Цена: ${price_cur:,.6f}\n"
+        f"🕒 Объём 5m: ${vol_m5_cur:,.0f}\n"
+        f"📊 Объём 24ч: ${vol_24h_cur:,.0f}\n"
+        f"🏦 Капитализация: ${mcap_cur:,.0f}\n"
+        f"🔗 {pair['url']}"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📈 Следить за ценой", callback_data=f"track_price:{address}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏦 Следить за капой", callback_data=f"track_mcap:{address}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🛰 Следить за объёмом (m5)", callback_data=f"track_vol:{address}"
+                ),
+            ],
+        ]
+    )
+
+    await update.message.reply_text(text_resp, reply_markup=keyboard)
+
 
 # ------------ КНОПКИ ------------
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     data = query.data or ""
     user_id = query.from_user.id
-    logger.info(f"🔘 Кнопка от {user_id}: {data}")
+    logger.info(f"BTN от {user_id}: {data}")
 
     state = pending_threshold_input.get(user_id) or {
         "pending_volume_for": None,
         "pending_price_for": None,
+        "pending_mcap_for": None,
     }
 
-    if data.startswith("track_vol:"):
-        address = data.split(":", 1)[1]
+    # Подписка
+    if data.startswith("track_"):
+        if data.startswith("track_vol:"):
+            address = data.split(":", 1)[1]
+            info = tracked_tokens.setdefault(
+                address,
+                {"symbol": None, "chain": None, "subscribers": {}},
+            )
+            ensure_subscriber(info, user_id)
+            state["pending_volume_for"] = address
+            pending_threshold_input[user_id] = state
+            await query.edit_message_reply_markup(reply_markup=None)
+            label = format_addr_with_meta(address, info)
+            await query.message.reply_text(
+                f"🛰 Введи порог изменения объёма m5 в % для {label}.\n"
+                f"Например: 20"
+            )
+            return
 
+        if data.startswith("track_price:"):
+            address = data.split(":", 1)[1]
+            info = tracked_tokens.setdefault(
+                address,
+                {"symbol": None, "chain": None, "subscribers": {}},
+            )
+            ensure_subscriber(info, user_id)
+            state["pending_price_for"] = address
+            pending_threshold_input[user_id] = state
+            await query.edit_message_reply_markup(reply_markup=None)
+            label = format_addr_with_meta(address, info)
+            await query.message.reply_text(
+                f"📈 Введи порог изменения цены в % для {label}.\n"
+                f"Например: 5"
+            )
+            return
+
+        if data.startswith("track_mcap:"):
+            address = data.split(":", 1)[1]
+            info = tracked_tokens.setdefault(
+                address,
+                {"symbol": None, "chain": None, "subscribers": {}},
+            )
+            ensure_subscriber(info, user_id)
+            state["pending_mcap_for"] = address
+            pending_threshold_input[user_id] = state
+            await query.edit_message_reply_markup(reply_markup=None)
+            label = format_addr_with_meta(address, info)
+            await query.message.reply_text(
+                f"🏦 Введи порог изменения капитализации в % для {label}.\n"
+                f"Например: 10"
+            )
+            return
+
+    # Отключение из алерта
+    if data.startswith("disable_"):
+        _, kind, address = data.split(":", 2)
         info = tracked_tokens.get(address)
         if not info:
-            info = {
-                "last_checks": deque(maxlen=1000),
-                "last_alert": 0.0,
-                "subscribers": {},
-                "symbol": None,
-                "chain": None,
-            }
-            tracked_tokens[address] = info
+            await query.message.reply_text("⚠️ Этот токен уже не отслеживается.")
+            return
 
-        info["subscribers"].setdefault(
-            user_id, {"vol_threshold": None, "price_threshold": None}
-        )
+        subs = info.get("subscribers", {})
+        sub = subs.get(user_id)
+        if not sub:
+            await query.message.reply_text("⚠️ Подписка для этого токена уже снята.")
+            return
 
-        state["pending_volume_for"] = address
-        pending_threshold_input[user_id] = state
-
-        await query.edit_message_reply_markup(reply_markup=None)
         label = format_addr_with_meta(address, info)
-        await query.message.reply_text(
-            f"📊 Введи процент изменения объёма m5 для {label}, при котором слать алерт.\n"
-            f"Например: 20"
-        )
 
-    elif data.startswith("track_price:"):
-        address = data.split(":", 1)[1]
+        if kind == "price":
+            sub["price_threshold"] = None
+            await query.message.reply_text(f"✅ Отключены алерты цены для {label}.")
+        elif kind == "mcap":
+            sub["mcap_threshold"] = None
+            await query.message.reply_text(f"✅ Отключены алерты капы для {label}.")
+        elif kind == "vol":
+            sub["vol_threshold"] = None
+            await query.message.reply_text(f"✅ Отключены алерты объёма для {label}.")
+        elif kind == "all":
+            subs.pop(user_id, None)
+            await query.message.reply_text(f"🛑 Полностью отключено отслеживание {label}.")
+            if not subs:
+                tracked_tokens.pop(address, None)
 
-        info = tracked_tokens.get(address)
-        if not info:
-            info = {
-                "last_checks": deque(maxlen=1000),
-                "last_alert": 0.0,
-                "subscribers": {},
-                "symbol": None,
-                "chain": None,
-            }
-            tracked_tokens[address] = info
+        return
 
-        info["subscribers"].setdefault(
-            user_id, {"vol_threshold": None, "price_threshold": None}
-        )
-
-        state["pending_price_for"] = address
-        pending_threshold_input[user_id] = state
-
-        await query.edit_message_reply_markup(reply_markup=None)
-        label = format_addr_with_meta(address, info)
-        await query.message.reply_text(
-            f"📈 Введи процент изменения цены для {label}, при котором слать алерт.\n"
-            f"Например: 5"
-        )
 
 # ------------ СПИСОК / ОТКЛЮЧЕНИЕ ------------
 
 async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logger.info(f"📋 /watchlist от {user_id}")
-
     rows = []
     for address, info in tracked_tokens.items():
-        cfg = info["subscribers"].get(user_id)
-        if not cfg:
+        sub = info.get("subscribers", {}).get(user_id)
+        if not sub:
             continue
-        vt = cfg.get("vol_threshold")
-        pt = cfg.get("price_threshold")
-        if vt is None and pt is None:
-            continue
-
+        vt = sub.get("vol_threshold")
+        pt = sub.get("price_threshold")
+        mt = sub.get("mcap_threshold")
         parts = []
-        if vt is not None:
-            parts.append(f"vol ≥ {vt:.1f}%")
         if pt is not None:
             parts.append(f"price ≥ {pt:.1f}%")
-
+        if mt is not None:
+            parts.append(f"mcap ≥ {mt:.1f}%")
+        if vt is not None:
+            parts.append(f"vol ≥ {vt:.1f}%")
+        if not parts:
+            continue
         label = format_addr_with_meta(address, info)
         rows.append(f"{label} ({', '.join(parts)})")
 
@@ -411,137 +467,193 @@ async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "🛰 Ты отслеживаешь:\n" + "\n".join(f"- {row}" for row in rows)
     await update.message.reply_text(text)
 
+
 async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logger.info(f"🗑 /unwatch от {user_id}")
-    
     if not context.args:
         await update.message.reply_text("Используй: /unwatch <адрес_контракта>")
         return
-
     address = context.args[0].strip()
-
     info = tracked_tokens.get(address)
-    if not info or user_id not in info["subscribers"]:
+    if not info or user_id not in info.get("subscribers", {}):
         await update.message.reply_text("❌ Этот адрес ты сейчас не отслеживаешь.")
         return
-
     info["subscribers"].pop(user_id, None)
     if not info["subscribers"]:
         tracked_tokens.pop(address, None)
-
     state = pending_threshold_input.get(user_id)
     if state:
         if state.get("pending_volume_for") == address:
             state["pending_volume_for"] = None
         if state.get("pending_price_for") == address:
             state["pending_price_for"] = None
+        if state.get("pending_mcap_for") == address:
+            state["pending_mcap_for"] = None
         pending_threshold_input[user_id] = state
-
     label = format_addr_with_meta(address, info or {})
     await update.message.reply_text(f"✅ Отключил отслеживание для {label}.")
 
-# ------------ ФОНОВЫЙ МОНИТОР v2.1 (БЕЗ JobQueue) ------------
+
+# ------------ ФОНОВЫЙ МОНИТОР ------------
+
 async def market_watcher(app: Application):
-    logger.info("🚀 Market watcher v2.1 запущен в отдельной задаче")
-    
+    logger.info("🚀 Market watcher запущен")
     while True:
         try:
-            logger.info(f"⏰ TICK #{int(time.time())} | Токенов: {len(tracked_tokens)}")
-            
             if not tracked_tokens:
                 await asyncio.sleep(5)
                 continue
 
             async with aiohttp.ClientSession() as session:
                 for address, info in list(tracked_tokens.items()):
+                    subs = info.get("subscribers") or {}
+                    if not subs:
+                        continue
+
                     try:
-                        logger.info(f"🔍 Проверяем {address[:8]}... | Subs: {len(info['subscribers'])}")
-                        
                         raw = await get_token_pairs_by_address(session, address)
                         pair = pick_best_pair(raw)
-                        
-                        if not pair:
-                            logger.warning(f"❌ Нет пары для {address}")
-                            continue
-
-                        volume_info = pair.get("volume") or {}
-                        volume_m5 = float(volume_info.get("m5", 0) or 0)
-                        price = float(pair.get("priceUsd", 0) or 0)
-                        
-                        logger.info(f"📊 {address[:8]}: vol_m5=${volume_m5:,.0f} | price=${price:.6f}")
-                        
-                        now_ts = time.time()
-                        
-                        history_full: deque = info.setdefault("last_checks", deque(maxlen=1000))
-                        history_full.append((now_ts, volume_m5, price))
-                        
-                        if len(history_full) > 1:
-                            last_ts, last_vol, last_price = history_full[-1]
-                            prev_ts, prev_vol, prev_price = history_full[-2]
-                            logger.info(f"📈 История: vol {last_vol/prev_vol:.1f}x | price {((last_price-prev_price)/prev_price*100):+.1f}%")
-
-                        if not info["subscribers"]:
-                            continue
-
-                        symbol = info.get("symbol") or pair["baseToken"]["symbol"]
-
-                        hist_vol = deque([(ts, v) for (ts, v, p) in history_full], maxlen=200)
-                        hist_price = deque([(ts, p) for (ts, v, p) in history_full], maxlen=200)
-
-                        for uid, cfg in list(info["subscribers"].items()):
-                            vt = cfg.get("vol_threshold")
-                            pt = cfg.get("price_threshold")
-
-                            vol_alerts = check_anomalies_generic(hist_vol, vt, "volume.m5") if vt else []
-                            price_alerts = check_anomalies_generic(hist_price, pt, "price") if pt else []
-
-                            if (vol_alerts or price_alerts) and (time.time() - info.get("last_alert", 0) > 10):
-                                info["last_alert"] = time.time()
-                                
-                                parts = []
-                                if vol_alerts:
-                                    parts.append("🚨 **ОБЪЁМ:**\n" + "\n".join(vol_alerts))
-                                if price_alerts:
-                                    parts.append("⚡ **ЦЕНА:**\n" + "\n".join(price_alerts))
-
-                                label = format_addr_with_meta(address, info)
-                                msg = f"**{symbol}**\n{label}\n\n" + "\n\n".join(parts)
-                                
-                                logger.info(f"🔔 ОТПРАВЛЯЕМ АЛЕРТ {uid}: {msg[:100]}...")
-                                
-                                try:
-                                    await app.bot.send_message(
-                                        chat_id=uid, 
-                                        text=msg, 
-                                        parse_mode='Markdown'
-                                    )
-                                    logger.info(f"✅ Алерт доставлен {uid}")
-                                except Exception as e:
-                                    logger.error(f"❌ Ошибка отправки {uid}: {e}")
-
                     except Exception as e:
-                        logger.error(f"💥 ОШИБКА {address[:8]}: {e}")
+                        logger.error(f"Ошибка обновления токена {address[:8]}: {e}")
+                        continue
 
-            logger.info("😴 Спим 5 сек...")
+                    if not pair:
+                        logger.warning(f"Нет пары для {address}")
+                        continue
+
+                    price_cur = float(pair.get("priceUsd", 0) or 0)
+                    volume_info = pair.get("volume") or {}
+                    vol_m5_cur = float(volume_info.get("m5", 0) or 0)
+                    mcap_cur = float(pair.get("marketCap") or pair.get("mcap") or 0)
+                    fdv = float(pair.get("fdv") or 0)
+                    if not mcap_cur and fdv:
+                        mcap_cur = fdv
+
+                    symbol = info.get("symbol") or pair["baseToken"]["symbol"]
+                    info["symbol"] = symbol
+                    info.setdefault("chain", pair.get("chainId"))
+
+                    for uid, cfg in list(subs.items()):
+                        # зафиксировать базовое состояние, если его нет
+                        if cfg.get("last_price") is None:
+                            cfg["last_price"] = price_cur
+                            cfg["last_volume_m5"] = vol_m5_cur
+                            cfg["last_mcap"] = mcap_cur
+                            cfg["last_ts"] = time.time()
+                            continue
+
+                        price_delta = pct_change(price_cur, cfg["last_price"])
+                        vol_delta = pct_change(vol_m5_cur, cfg["last_volume_m5"])
+                        mcap_delta = pct_change(mcap_cur, cfg["last_mcap"])
+
+                        pt = cfg.get("price_threshold")
+                        vt = cfg.get("vol_threshold")
+                        mt = cfg.get("mcap_threshold")
+
+                        triggered = False
+                        reason_lines = []
+
+                        # приоритет: цена, капитализация, объём
+                        if pt is not None and price_delta is not None and abs(price_delta) >= pt:
+                            direction = "⬆️" if price_delta > 0 else "⬇️"
+                            reason_lines.append(f"{direction} Цена: {price_delta:.2f}%")
+                            triggered = True
+
+                        if not triggered and mt is not None and mcap_delta is not None and abs(mcap_delta) >= mt:
+                            direction = "⬆️" if mcap_delta > 0 else "⬇️"
+                            reason_lines.append(f"{direction} Капитализация: {mcap_delta:.2f}%")
+                            triggered = True
+
+                        if not triggered and vt is not None and vol_delta is not None and abs(vol_delta) >= vt:
+                            direction = "⬆️" if vol_delta > 0 else "⬇️"
+                            reason_lines.append(f"{direction} Объём m5: {vol_delta:.2f}%")
+                            triggered = True
+
+                        if not triggered:
+                            continue
+
+                        # Полная картина изменений
+                        extra_lines = []
+                        if price_delta is not None:
+                            extra_lines.append(f"Цена: {price_delta:+.2f}%")
+                        if mcap_delta is not None:
+                            extra_lines.append(f"Капитализация: {mcap_delta:+.2f}%")
+                        if vol_delta is not None:
+                            extra_lines.append(f"Объём m5: {vol_delta:+.2f}%")
+
+                        label = format_addr_with_meta(address, info)
+                        msg = (
+                            f"🚨 {symbol}\n{label}\n\n"
+                            f"{'; '.join(reason_lines)}\n\n"
+                            f"Текущие значения:\n"
+                            f"💰 Цена: ${price_cur:,.6f}\n"
+                            f"🕒 Объём 5m: ${vol_m5_cur:,.0f}\n"
+                            f"🏦 Капитализация: ${mcap_cur:,.0f}\n\n"
+                            f"Изменение от предыдущего состояния:\n"
+                            f"{'; '.join(extra_lines)}"
+                        )
+
+                        keyboard = InlineKeyboardMarkup(
+                            [
+                                [
+                                    InlineKeyboardButton(
+                                        "❌ Цена",
+                                        callback_data=f"disable_price:{address}",
+                                    ),
+                                    InlineKeyboardButton(
+                                        "❌ Капа",
+                                        callback_data=f"disable_mcap:{address}",
+                                    ),
+                                ],
+                                [
+                                    InlineKeyboardButton(
+                                        "❌ Объём",
+                                        callback_data=f"disable_vol:{address}",
+                                    ),
+                                    InlineKeyboardButton(
+                                        "🛑 Всё",
+                                        callback_data=f"disable_all:{address}",
+                                    ),
+                                ],
+                            ]
+                        )
+
+                        try:
+                            await app.bot.send_message(
+                                chat_id=uid,
+                                text=msg,
+                                reply_markup=keyboard,
+                                parse_mode="Markdown",
+                            )
+                            logger.info(f"Алёрт отправлен {uid} для {address[:8]}")
+                        except Exception as e:
+                            logger.error(f"Ошибка отправки алерта {uid}: {e}")
+
+                        # обновляем базовое состояние после алерта
+                        cfg["last_price"] = price_cur
+                        cfg["last_volume_m5"] = vol_m5_cur
+                        cfg["last_mcap"] = mcap_cur
+                        cfg["last_ts"] = time.time()
+
             await asyncio.sleep(5)
+
         except Exception as e:
-            logger.error(f"💥 КРИТИЧЕСКАЯ ОШИБКА market_watcher: {e}")
+            logger.error(f"Критическая ошибка market_watcher: {e}")
             await asyncio.sleep(10)
 
+
 async def post_init(app: Application):
-    """Запускаем market_watcher в фоне БЕЗ JobQueue"""
-    logger.info("🚀 post_init: Запускаем market_watcher в фоне")
+    logger.info("post_init: запускаем market_watcher в фоне")
     asyncio.create_task(market_watcher(app))
-    logger.info("🚀 Market watcher v2.1 запущен в фоне!")
+
 
 # ------------ MAIN ------------
+
 def main():
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN не найден. Проверь переменную в Railway.")
+        logger.error("BOT_TOKEN не найден. Проверь переменную окружения.")
         raise SystemExit("BOT_TOKEN is missing")
 
-    logger.info("🚀 Создаём Application...")
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -549,7 +661,6 @@ def main():
         .build()
     )
 
-    logger.info("🚀 Добавляем хендлеры...")
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("watchlist", watchlist))
@@ -557,8 +668,9 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
 
-    logger.info("🚀 Бот v2.1 полностью готов! Запускаем polling...")
+    logger.info("Бот запущен, начинаем polling…")
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()

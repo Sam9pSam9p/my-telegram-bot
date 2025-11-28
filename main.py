@@ -1685,6 +1685,73 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 
+# ============ WATCHLIST ============
+
+async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просмотр Watchlist"""
+    user_id = update.effective_user.id
+
+    items_active = []
+    items_disabled = []
+    
+    for address, info in tracked_tokens.items():
+        sub = info.get("subscribers", {}).get(user_id)
+        if not sub:
+            continue
+
+        vt = sub.get("vol_threshold")
+        pt = sub.get("price_threshold")
+        mt = sub.get("mcap_threshold")
+
+        symbol = info.get("symbol", "")
+        short_address = short_addr(address)
+
+        has_active = pt is not None or mt is not None or vt is not None
+
+        if has_active:
+            parts = []
+            if pt is not None:
+                parts.append(f"📈 {pt:.1f}%")
+            if mt is not None:
+                parts.append(f"🏦 {mt:.1f}%")
+            if vt is not None:
+                parts.append(f"🛰 {vt:.1f}%")
+            
+            params = " ".join(parts)
+            btn_text = f"{symbol} {short_address} {params}"
+            items_active.append((address, btn_text, "menu"))
+        else:
+            btn_text = f"{symbol} {short_address} ⛔"
+            items_disabled.append((address, btn_text, "menu_disabled"))
+
+    if not items_active and not items_disabled:
+        await update.message.reply_text(
+            "👀 Сейчас ты ничего не отслеживаешь.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    keyboard_buttons = []
+    
+    if items_active:
+        keyboard_buttons.append([InlineKeyboardButton("🟢 АКТИВНЫЕ", callback_data="noop")])
+        for address, btn_text, callback_prefix in items_active:
+            keyboard_buttons.append(
+                [InlineKeyboardButton(btn_text, callback_data=f"{callback_prefix}:{address}")]
+            )
+    
+    if items_disabled:
+        if items_active:
+            keyboard_buttons.append([InlineKeyboardButton("⚫ БЕЗ АЛЕРТОВ", callback_data="noop")])
+        for address, btn_text, callback_prefix in items_disabled:
+            keyboard_buttons.append(
+                [InlineKeyboardButton(btn_text, callback_data=f"{callback_prefix}:{address}")]
+            )
+
+    keyboard = InlineKeyboardMarkup(keyboard_buttons)
+
+    text = "🛰 **Твой Watchlist:**\n\nНажми на токен для управления:"
+    await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
 # ============ ФОНОВЫЙ МОНИТОР ============
 

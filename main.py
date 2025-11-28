@@ -2,6 +2,7 @@ import os
 import time
 import logging
 import asyncio
+from collections import deque
 
 import aiohttp
 from telegram import (
@@ -47,6 +48,8 @@ logger = logging.getLogger(__name__)
 #             "last_volume_m5": float | None,
 #             "last_mcap": float | None,
 #             "last_ts": float | None,
+#             "last_alert_ts": float | None,
+#             "volume_history": deque[(ts, buy_vol, sell_vol)],
 #         }
 #     }
 # }
@@ -118,6 +121,8 @@ def ensure_subscriber(info: dict, user_id: int) -> dict:
             "last_volume_m5": None,
             "last_mcap": None,
             "last_ts": None,
+            "last_alert_ts": None,
+            "volume_history": deque(maxlen=200),
         }
         subs[user_id] = sub
 
@@ -133,6 +138,32 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         one_time_keyboard=False,
     )
+
+
+def detect_pump_dump(history: deque) -> str:
+    """
+    Анализирует историю buy/sell объёмов и определяет возможные памп/дамп.
+    Возвращает строку с анализом.
+    """
+    if len(history) < 3:
+        return ""
+
+    recent = list(history)[-5:]  # последние 5 записей
+    buy_vols = [b for _, b, _ in recent]
+    sell_vols = [s for _, _, s in recent]
+
+    avg_buy = sum(buy_vols) / len(buy_vols) if buy_vols else 0
+    avg_sell = sum(sell_vols) / len(sell_vols) if sell_vols else 0
+
+    # Памп: резкое увеличение buy объёма
+    if buy_vols and buy_vols[-1] > avg_buy * 2.5:
+        return "📈 Возможный памп (высокий buy объём)"
+    
+    # Дамп: резкое увеличение sell объёма
+    if sell_vols and sell_vols[-1] > avg_sell * 2.5:
+        return "📉 Возможный дамп (высокий sell объём)"
+    
+    return ""
 
 
 # ------------ КОМАНДЫ ------------
@@ -158,7 +189,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- Отправь адрес контракта, чтобы получить инфо и кнопки отслеживания.\n"
         "- Выбери, что отслеживать (цена, капа, объём) и задай порог в %.\n"
         "- /watchlist покажет все активные токены.\n"
-        "- В алертах есть кнопки, чтобы отключить параметры или всё сразу."
+        "- В алертах есть кнопки, чтобы отключить параметры или всё сразу.\n"
+        "- Бот анализирует buy/sell объёмы и показывает возможные памп/дамп."
     )
 
 
@@ -440,6 +472,60 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "pending_mcap_for": None,
     }
 
+    # ============ МЕНЮ ОТКЛЮЧЁННОГО ТОКЕНА (В СПИСКЕ) ============
+    if data.startswith("menu_disabled:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text(
+                "⚠️ Этот токен больше не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        sub = info["subscribers"][user_id]
+        symbol = info.get("symbol", "")
+
+        text = (
+            f"📌 {symbol} {address}\n\n"
+            f"⛔ Отслеживание отключено\n\n"
+            f"Выбери параметр для подключения:"
+        )
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "📈 Отслеживать цену", callback_data=f"track_price:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🏦 Отслеживать капу", callback_data=f"track_mcap:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🛰 Отслеживать объём", callback_data=f"track_vol:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🛑 Удалить из списка", callback_data=f"delete:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад", callback_data="back_to_watchlist"
+                    ),
+                ],
+            ]
+        )
+
+        await query.edit_message_text(text=text, reply_markup=keyboard)
+        return
+
     # ============ ДЕТАЛЬНОЕ МЕНЮ ТОКЕНА ИЗ WATCHLIST ============
     if data.startswith("menu:"):
         address = data.split(":", 1)[1]
@@ -454,12 +540,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         sub = info["subscribers"][user_id]
         label = format_addr_with_meta(address, info)
+        symbol = info.get("symbol", "")
 
         vt = sub.get("vol_threshold")
         pt = sub.get("price_threshold")
         mt = sub.get("mcap_threshold")
 
-        status_lines = []
+        status_lines = [f"📌 {symbol} {address}"]
+        status_lines.append("")
+        
         if pt is not None:
             status_lines.append(f"📈 Цена: {pt:.1f}%")
         else:
@@ -475,7 +564,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             status_lines.append("🛰 Объём: ⛔")
 
-        text = f"📌 {label}\n\n" + "\n".join(status_lines)
+        # Анализ памп/дамп
+        pump_dump = detect_pump_dump(sub.get("volume_history", deque()))
+        if pump_dump:
+            status_lines.append("")
+            status_lines.append(pump_dump)
+
+        text = "\n".join(status_lines)
 
         # Кнопки отключения параметров
         keyboard = InlineKeyboardMarkup(
@@ -693,7 +788,9 @@ async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Интерактивный Watchlist с меню для каждого токена"""
     user_id = update.effective_user.id
 
-    items = []
+    items_active = []
+    items_disabled = []
+    
     for address, info in tracked_tokens.items():
         sub = info.get("subscribers", {}).get(user_id)
         if not sub:
@@ -703,39 +800,56 @@ async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pt = sub.get("price_threshold")
         mt = sub.get("mcap_threshold")
 
-        parts = []
-        if pt is not None:
-            parts.append(f"price ≥ {pt:.1f}%")
-        if mt is not None:
-            parts.append(f"mcap ≥ {mt:.1f}%")
-        if vt is not None:
-            parts.append(f"vol ≥ {vt:.1f}%")
-        if not parts:
-            parts.append("параметры отключены")
-
         label = format_addr_with_meta(address, info)
-        items.append((address, label, parts))
+        symbol = label.split()[0]
 
-    if not items:
+        # Проверяем, есть ли активные пороги
+        has_active = pt is not None or mt is not None or vt is not None
+
+        if has_active:
+            parts = []
+            if pt is not None:
+                parts.append(f"price ≥ {pt:.1f}%")
+            if mt is not None:
+                parts.append(f"mcap ≥ {mt:.1f}%")
+            if vt is not None:
+                parts.append(f"vol ≥ {vt:.1f}%")
+            
+            params = ", ".join(parts)
+            btn_text = f"{symbol} • {params}"
+            items_active.append((address, btn_text, "menu"))
+        else:
+            btn_text = f"{symbol} (⛔ отключено)"
+            items_disabled.append((address, btn_text, "menu_disabled"))
+
+    if not items_active and not items_disabled:
         await update.message.reply_text(
             "👀 Сейчас ты ничего не отслеживаешь.",
             reply_markup=main_menu_keyboard(),
         )
         return
 
-    # Строим кнопки для каждого токена
+    # Строим кнопки для активных токенов
     keyboard_buttons = []
-    for address, label, parts in items:
-        symbol = label.split()[0][:8]
-        params = ", ".join(parts[:2])
-        btn_text = f"{symbol}… ({params})"
-        keyboard_buttons.append(
-            [InlineKeyboardButton(btn_text, callback_data=f"menu:{address}")]
-        )
+    
+    if items_active:
+        keyboard_buttons.append([InlineKeyboardButton("🟢 АКТИВНЫЕ", callback_data="disabled_button")])
+        for address, btn_text, callback_prefix in items_active:
+            keyboard_buttons.append(
+                [InlineKeyboardButton(btn_text, callback_data=f"{callback_prefix}:{address}")]
+            )
+    
+    if items_disabled:
+        if items_active:
+            keyboard_buttons.append([InlineKeyboardButton("⚫ В СПИСКЕ (БЕЗ АЛЕРТОВ)", callback_data="disabled_button")])
+        for address, btn_text, callback_prefix in items_disabled:
+            keyboard_buttons.append(
+                [InlineKeyboardButton(btn_text, callback_data=f"{callback_prefix}:{address}")]
+            )
 
     keyboard = InlineKeyboardMarkup(keyboard_buttons)
 
-    text = "🛰 Твой Watchlist:\n\nНажми на токен для меню управления:"
+    text = "🛰 Твой Watchlist:\n\nНажми на токен для управления:"
     await update.message.reply_text(text, reply_markup=keyboard)
 
 
@@ -781,7 +895,32 @@ async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ------------ ФОНОВЫЙ МОНИТОР ------------
+# ------------ ФОНОВЫЙ МОНИТОР (С АНАЛИЗОМ BUY/SELL) ------------
+
+def analyze_volume_windows(history: deque, current_ts: float) -> dict:
+    """
+    Анализирует объёмы по временным окнам: 5s, 10s, 20s, 30s
+    Возвращает dict с информацией об изменениях.
+    """
+    windows = {
+        "5s": 5,
+        "10s": 10,
+        "20s": 20,
+        "30s": 30,
+    }
+    
+    result = {}
+    
+    for label, span in windows.items():
+        recent = [vol for ts, vol in history if current_ts - ts <= span]
+        if len(recent) < 2:
+            continue
+        
+        change = ((recent[-1] - recent[0]) / recent[0] * 100) if recent[0] > 0 else 0
+        result[label] = change
+    
+    return result
+
 
 async def market_watcher(app: Application):
     logger.info("🚀 Market watcher запущен")
@@ -816,6 +955,15 @@ async def market_watcher(app: Application):
                     volume_info = pair.get("volume") or {}
                     vol_m5_cur = float(volume_info.get("m5", 0) or 0)
 
+                    # Попытаемся вытащить buy/sell объёмы (если доступны в API)
+                    try:
+                        trades = pair.get("trades") or {}
+                        buy_vol = float(trades.get("h1Buy", 0) or 0)
+                        sell_vol = float(trades.get("h1Sell", 0) or 0)
+                    except:
+                        buy_vol = vol_m5_cur * 0.5  # приблизительно
+                        sell_vol = vol_m5_cur * 0.5
+
                     mcap_cur = float(pair.get("marketCap") or pair.get("mcap") or 0)
                     fdv = float(pair.get("fdv") or 0)
 
@@ -833,7 +981,13 @@ async def market_watcher(app: Application):
                             cfg["last_volume_m5"] = vol_m5_cur
                             cfg["last_mcap"] = mcap_cur
                             cfg["last_ts"] = time.time()
+                            # Инициализируем историю buy/sell
+                            cfg["volume_history"].append((time.time(), buy_vol, sell_vol))
                             continue
+
+                        # Добавляем в историю buy/sell
+                        now_ts = time.time()
+                        cfg["volume_history"].append((now_ts, buy_vol, sell_vol))
 
                         price_delta = pct_change(price_cur, cfg["last_price"])
                         vol_delta = pct_change(vol_m5_cur, cfg["last_volume_m5"])
@@ -881,6 +1035,11 @@ async def market_watcher(app: Application):
                         if not triggered:
                             continue
 
+                        # Анализ временных окон
+                        vol_windows = analyze_volume_windows(
+                            deque([(t, v) for t, _, v in cfg["volume_history"]]), now_ts
+                        )
+
                         # Полная картина изменений
                         extra_lines = []
                         if price_delta is not None:
@@ -890,7 +1049,20 @@ async def market_watcher(app: Application):
                         if vol_delta is not None:
                             extra_lines.append(f"Объём m5: {vol_delta:+.2f}%")
 
+                        # Добавляем анализ по окнам
+                        for window_label, window_change in vol_windows.items():
+                            if window_change != 0:
+                                extra_lines.append(f"Объём {window_label}: {window_change:+.1f}%")
+
+                        # Анализ памп/дамп
+                        pump_dump = detect_pump_dump(cfg["volume_history"])
+
                         label = format_addr_with_meta(address, info)
+
+                        # Время с момента последнего алерта
+                        last_alert_ts = cfg.get("last_alert_ts") or 0
+                        time_since_alert = now_ts - last_alert_ts
+                        time_str = f"{int(time_since_alert)}s" if time_since_alert < 60 else f"{int(time_since_alert / 60)}m"
 
                         msg = (
                             f"🚨 {symbol}\n{label}\n\n"
@@ -902,6 +1074,11 @@ async def market_watcher(app: Application):
                             f"Изменение от предыдущего состояния:\n"
                             f"{'; '.join(extra_lines)}"
                         )
+
+                        if pump_dump:
+                            msg += f"\n\n⚡ {pump_dump}"
+
+                        msg += f"\n\n⏱️ От последнего сигнала: {time_str}"
 
                         keyboard = InlineKeyboardMarkup(
                             [
@@ -937,6 +1114,7 @@ async def market_watcher(app: Application):
                             )
 
                             logger.info(f"Алёрт отправлен {uid} для {address[:8]}")
+                            cfg["last_alert_ts"] = now_ts
 
                         except Exception as e:
                             logger.error(f"Ошибка отправки алерта {uid}: {e}")

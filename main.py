@@ -60,6 +60,9 @@ tracked_tokens: dict[str, dict] = {}
 #     "pending_volume_for": address | None,
 #     "pending_price_for": address | None,
 #     "pending_mcap_for": address | None,
+#     "pending_multi": address | None,  # для множественного выбора
+#     "multi_params": [],  # какие параметры выбраны
+#     "multi_step": 0,  # текущий шаг ввода (0=цена, 1=капа, 2=объём)
 # }
 
 pending_threshold_input: dict[int, dict] = {}
@@ -100,6 +103,13 @@ def format_addr_with_meta(address: str, info: dict | None) -> str:
         return base
 
     return f"{base} ({', '.join(meta)})"
+
+
+def short_addr(address: str) -> str:
+    """Сокращает адрес: первые 4 + ... + последние 4 символа"""
+    if len(address) <= 10:
+        return address
+    return f"{address[:4]}...{address[-4:]}"
 
 
 def pct_change(new: float | None, old: float | None) -> float | None:
@@ -173,8 +183,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Привет! Я крипто-бот.\n\n"
         "1) Отправь адрес токена (Sol/ETH/Base/BNB).\n"
-        "2) Нажми кнопку отслеживания цены / объёма / капы.\n"
-        "3) Введи порог в %.\n\n"
+        "2) Нажми кнопку отслеживания параметров.\n"
+        "3) Выбери один или несколько параметров.\n"
+        "4) Введи пороги в %.\n\n"
         "/watchlist — текущие подписки\n"
         "/unwatch <адрес> — убрать токен\n"
         "/price — цена BTC\n\n"
@@ -187,7 +198,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "ℹ️ Краткая справка:\n"
         "- Отправь адрес контракта, чтобы получить инфо и кнопки отслеживания.\n"
-        "- Выбери, что отслеживать (цена, капа, объём) и задай порог в %.\n"
+        "- Выбери один, несколько или все три параметра для отслеживания.\n"
+        "- Задай пороги в % для каждого выбранного параметра.\n"
         "- /watchlist покажет все активные токены.\n"
         "- В алертах есть кнопки, чтобы отключить параметры или всё сразу.\n"
         "- Бот анализирует buy/sell объёмы и показывает возможные памп/дамп."
@@ -241,7 +253,100 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "pending_volume_for": None,
         "pending_price_for": None,
         "pending_mcap_for": None,
+        "pending_multi": None,
+        "multi_params": [],
+        "multi_step": 0,
     }
+
+    # ============ МНОЖЕСТВЕННЫЙ ВВОД ПАРАМЕТРОВ ============
+    if state.get("pending_multi"):
+        address = state["pending_multi"]
+        multi_params = state.get("multi_params", [])
+        multi_step = state.get("multi_step", 0)
+
+        try:
+            threshold = float(text.replace(",", "."))
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Не понял число. Введи %, например: 5",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        if threshold <= 0:
+            await update.message.reply_text(
+                "❌ Порог должен быть > 0.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        info = tracked_tokens.get(address)
+        if not info:
+            await update.message.reply_text(
+                "❌ Этот контракт уже не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
+            pending_threshold_input.pop(user_id, None)
+            return
+
+        sub = ensure_subscriber(info, user_id)
+
+        # Заполняем пороги по очереди
+        if multi_step == 0 and "price" in multi_params:
+            sub["price_threshold"] = threshold
+            multi_step = 1
+            if "mcap" not in multi_params:
+                multi_step = 2
+            if "vol" not in multi_params and multi_step == 2:
+                multi_step = 3
+
+        elif multi_step == 1 and "mcap" in multi_params:
+            sub["mcap_threshold"] = threshold
+            multi_step = 2
+            if "vol" not in multi_params:
+                multi_step = 3
+
+        elif multi_step == 2 and "vol" in multi_params:
+            sub["vol_threshold"] = threshold
+            multi_step = 3
+
+        state["multi_step"] = multi_step
+        pending_threshold_input[user_id] = state
+
+        # Если все параметры введены
+        if multi_step >= 3:
+            label = format_addr_with_meta(address, info)
+            params_text = []
+            if sub.get("price_threshold") is not None:
+                params_text.append(f"📈 Цена: {sub['price_threshold']:.1f}%")
+            if sub.get("mcap_threshold") is not None:
+                params_text.append(f"🏦 Капа: {sub['mcap_threshold']:.1f}%")
+            if sub.get("vol_threshold") is not None:
+                params_text.append(f"🛰 Объём: {sub['vol_threshold']:.1f}%")
+
+            await update.message.reply_text(
+                f"✅ Отслеживание для {label} настроено:\n" + "\n".join(params_text),
+                reply_markup=main_menu_keyboard(),
+            )
+            state["pending_multi"] = None
+            state["multi_params"] = []
+            state["multi_step"] = 0
+            pending_threshold_input[user_id] = state
+            return
+
+        # Следующий параметр
+        next_param = None
+        if multi_step == 1 and "mcap" in multi_params:
+            next_param = "🏦 капитализации"
+        elif multi_step == 2 and "vol" in multi_params:
+            next_param = "🛰 объёма m5"
+
+        if next_param:
+            await update.message.reply_text(
+                f"Введи порог изменения {next_param} в %. Например: 10",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
 
     # Ввод порога объёма
     if state.get("pending_volume_for"):
@@ -321,8 +426,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         label = format_addr_with_meta(address, info)
         await update.message.reply_text(
-            f"✅ Порог цены для {label}: {threshold:.1f}%.\n"
-            f"Приоритетный сигнал: изменение цены относительно предыдущего состояния.",
+            f"✅ Порог цены для {label}: {threshold:.1f}%.",
             reply_markup=main_menu_keyboard(),
         )
         return
@@ -363,8 +467,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         label = format_addr_with_meta(address, info)
         await update.message.reply_text(
-            f"✅ Порог капитализации для {label}: {threshold:.1f}%.\n"
-            f"Приоритетный сигнал: изменение капитализации относительно предыдущего состояния.",
+            f"✅ Порог капитализации для {label}: {threshold:.1f}%.",
             reply_markup=main_menu_keyboard(),
         )
         return
@@ -436,17 +539,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             [
                 InlineKeyboardButton(
-                    "📈 Следить за ценой", callback_data=f"track_price:{address}"
+                    "📈 Цена", callback_data=f"select_price:{address}"
+                ),
+                InlineKeyboardButton(
+                    "🏦 Капа", callback_data=f"select_mcap:{address}"
+                ),
+                InlineKeyboardButton(
+                    "🛰 Объём", callback_data=f"select_vol:{address}"
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    "🏦 Следить за капой", callback_data=f"track_mcap:{address}"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "🛰 Следить за объёмом (m5)", callback_data=f"track_vol:{address}"
+                    "✅ Все три параметра", callback_data=f"select_all:{address}"
                 ),
             ],
         ]
@@ -455,7 +559,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text_resp, reply_markup=keyboard)
 
 
-# ------------ КНОПКИ ------------
+# ------------ КНОПКИ ВЫБОРА ПАРАМЕТРОВ (МНОЖЕСТВЕННЫЙ ВЫБОР) ============
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -470,7 +574,90 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "pending_volume_for": None,
         "pending_price_for": None,
         "pending_mcap_for": None,
+        "pending_multi": None,
+        "multi_params": [],
+        "multi_step": 0,
     }
+
+    # ============ ВЫБОР ВСЕХ ТРЁХ ПАРАМЕТРОВ ============
+    if data.startswith("select_all:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_multi"] = address
+        state["multi_params"] = ["price", "mcap", "vol"]
+        state["multi_step"] = 0
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"📈 Введи порог изменения цены в % для {label}.\n"
+            f"Например: 5",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # ============ ВЫБОР ОДНОГО ПАРАМЕТРА ============
+    if data.startswith("select_price:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_price_for"] = address
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"📈 Введи порог изменения цены в % для {label}.\n"
+            f"Например: 5",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    if data.startswith("select_mcap:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_mcap_for"] = address
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"🏦 Введи порог изменения капитализации в % для {label}.\n"
+            f"Например: 10",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    if data.startswith("select_vol:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_volume_for"] = address
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"🛰 Введи порог изменения объёма m5 в % для {label}.\n"
+            f"Например: 20",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
 
     # ============ МЕНЮ ОТКЛЮЧЁННОГО ТОКЕНА (В СПИСКЕ) ============
     if data.startswith("menu_disabled:"):
@@ -486,28 +673,30 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         sub = info["subscribers"][user_id]
         symbol = info.get("symbol", "")
+        short_address = short_addr(address)
 
         text = (
-            f"📌 {symbol} {address}\n\n"
+            f"📌 {symbol} {short_address}\n\n"
             f"⛔ Отслеживание отключено\n\n"
-            f"Выбери параметр для подключения:"
+            f"Выбери параметры для подключения:"
         )
 
         keyboard = InlineKeyboardMarkup(
             [
                 [
                     InlineKeyboardButton(
-                        "📈 Отслеживать цену", callback_data=f"track_price:{address}"
+                        "📈 Цена", callback_data=f"select_price:{address}"
+                    ),
+                    InlineKeyboardButton(
+                        "🏦 Капа", callback_data=f"select_mcap:{address}"
+                    ),
+                    InlineKeyboardButton(
+                        "🛰 Объём", callback_data=f"select_vol:{address}"
                     ),
                 ],
                 [
                     InlineKeyboardButton(
-                        "🏦 Отслеживать капу", callback_data=f"track_mcap:{address}"
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🛰 Отслеживать объём", callback_data=f"track_vol:{address}"
+                        "✅ Все три", callback_data=f"select_all:{address}"
                     ),
                 ],
                 [
@@ -539,14 +728,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         sub = info["subscribers"][user_id]
-        label = format_addr_with_meta(address, info)
         symbol = info.get("symbol", "")
+        short_address = short_addr(address)
 
         vt = sub.get("vol_threshold")
         pt = sub.get("price_threshold")
         mt = sub.get("mcap_threshold")
 
-        status_lines = [f"📌 {symbol} {address}"]
+        status_lines = [f"📌 {symbol} {short_address}"]
         status_lines.append("")
         
         if pt is not None:
@@ -653,6 +842,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 state["pending_price_for"] = None
             if state.get("pending_mcap_for") == address:
                 state["pending_mcap_for"] = None
+            if state.get("pending_multi") == address:
+                state["pending_multi"] = None
             pending_threshold_input[user_id] = state
 
         await query.message.reply_text(
@@ -665,65 +856,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "back_to_watchlist":
         await watchlist(update, context)
         return
-
-    # ============ ПОДПИСКА НА ОТСЛЕЖИВАНИЕ ============
-    if data.startswith("track_"):
-        if data.startswith("track_vol:"):
-            address = data.split(":", 1)[1]
-            info = tracked_tokens.setdefault(
-                address, {"symbol": None, "chain": None, "subscribers": {}}
-            )
-
-            ensure_subscriber(info, user_id)
-            state["pending_volume_for"] = address
-            pending_threshold_input[user_id] = state
-
-            await query.edit_message_reply_markup(reply_markup=None)
-            label = format_addr_with_meta(address, info)
-            await query.message.reply_text(
-                f"🛰 Введи порог изменения объёма m5 в % для {label}.\n"
-                f"Например: 20",
-                reply_markup=main_menu_keyboard(),
-            )
-            return
-
-        if data.startswith("track_price:"):
-            address = data.split(":", 1)[1]
-            info = tracked_tokens.setdefault(
-                address, {"symbol": None, "chain": None, "subscribers": {}}
-            )
-
-            ensure_subscriber(info, user_id)
-            state["pending_price_for"] = address
-            pending_threshold_input[user_id] = state
-
-            await query.edit_message_reply_markup(reply_markup=None)
-            label = format_addr_with_meta(address, info)
-            await query.message.reply_text(
-                f"📈 Введи порог изменения цены в % для {label}.\n"
-                f"Например: 5",
-                reply_markup=main_menu_keyboard(),
-            )
-            return
-
-        if data.startswith("track_mcap:"):
-            address = data.split(":", 1)[1]
-            info = tracked_tokens.setdefault(
-                address, {"symbol": None, "chain": None, "subscribers": {}}
-            )
-
-            ensure_subscriber(info, user_id)
-            state["pending_mcap_for"] = address
-            pending_threshold_input[user_id] = state
-
-            await query.edit_message_reply_markup(reply_markup=None)
-            label = format_addr_with_meta(address, info)
-            await query.message.reply_text(
-                f"🏦 Введи порог изменения капитализации в % для {label}.\n"
-                f"Например: 10",
-                reply_markup=main_menu_keyboard(),
-            )
-            return
 
     # ============ ОТКЛЮЧЕНИЕ ИЗ АЛЕРТА ============
     if data.startswith("disable_"):
@@ -800,8 +932,8 @@ async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pt = sub.get("price_threshold")
         mt = sub.get("mcap_threshold")
 
-        label = format_addr_with_meta(address, info)
-        symbol = label.split()[0]
+        symbol = info.get("symbol", "")
+        short_address = short_addr(address)
 
         # Проверяем, есть ли активные пороги
         has_active = pt is not None or mt is not None or vt is not None
@@ -809,17 +941,17 @@ async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if has_active:
             parts = []
             if pt is not None:
-                parts.append(f"price ≥ {pt:.1f}%")
+                parts.append(f"📈 {pt:.1f}%")
             if mt is not None:
-                parts.append(f"mcap ≥ {mt:.1f}%")
+                parts.append(f"🏦 {mt:.1f}%")
             if vt is not None:
-                parts.append(f"vol ≥ {vt:.1f}%")
+                parts.append(f"🛰 {vt:.1f}%")
             
-            params = ", ".join(parts)
-            btn_text = f"{symbol} • {params}"
+            params = " ".join(parts)
+            btn_text = f"{symbol} {short_address} {params}"
             items_active.append((address, btn_text, "menu"))
         else:
-            btn_text = f"{symbol} (⛔ отключено)"
+            btn_text = f"{symbol} {short_address} ⛔"
             items_disabled.append((address, btn_text, "menu_disabled"))
 
     if not items_active and not items_disabled:
@@ -833,7 +965,7 @@ async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard_buttons = []
     
     if items_active:
-        keyboard_buttons.append([InlineKeyboardButton("🟢 АКТИВНЫЕ", callback_data="disabled_button")])
+        keyboard_buttons.append([InlineKeyboardButton("🟢 АКТИВНЫЕ", callback_data="noop")])
         for address, btn_text, callback_prefix in items_active:
             keyboard_buttons.append(
                 [InlineKeyboardButton(btn_text, callback_data=f"{callback_prefix}:{address}")]
@@ -841,7 +973,7 @@ async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if items_disabled:
         if items_active:
-            keyboard_buttons.append([InlineKeyboardButton("⚫ В СПИСКЕ (БЕЗ АЛЕРТОВ)", callback_data="disabled_button")])
+            keyboard_buttons.append([InlineKeyboardButton("⚫ БЕЗ АЛЕРТОВ", callback_data="noop")])
         for address, btn_text, callback_prefix in items_disabled:
             keyboard_buttons.append(
                 [InlineKeyboardButton(btn_text, callback_data=f"{callback_prefix}:{address}")]
@@ -886,6 +1018,8 @@ async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state["pending_price_for"] = None
         if state.get("pending_mcap_for") == address:
             state["pending_mcap_for"] = None
+        if state.get("pending_multi") == address:
+            state["pending_multi"] = None
         pending_threshold_input[user_id] = state
 
     label = format_addr_with_meta(address, info or {})

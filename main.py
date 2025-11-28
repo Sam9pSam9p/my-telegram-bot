@@ -704,3 +704,84 @@ async def market_watcher(app: Application):
                         )
 
                         keyboard = InlineKeyboardMarkup(
+                            [
+                                [
+                                    InlineKeyboardButton(
+                                        "❌ Цена",
+                                        callback_data=f"disable_price:{address}",
+                                    ),
+                                    InlineKeyboardButton(
+                                        "❌ Капа",
+                                        callback_data=f"disable_mcap:{address}",
+                                    ),
+                                ],
+                                [
+                                    InlineKeyboardButton(
+                                        "❌ Объём",
+                                        callback_data=f"disable_vol:{address}",
+                                    ),
+                                    InlineKeyboardButton(
+                                        "🛑 Всё",
+                                        callback_data=f"disable_all:{address}",
+                                    ),
+                                ],
+                            ]
+                        )
+
+                        try:
+                            await app.bot.send_message(
+                                chat_id=uid,
+                                text=msg,
+                                reply_markup=keyboard,
+                                parse_mode="Markdown",
+                            )
+                            logger.info(f"Алёрт отправлен {uid} для {address[:8]}")
+                        except Exception as e:
+                            logger.error(f"Ошибка отправки алерта {uid}: {e}")
+
+                        # обновляем базовое состояние после алерта
+                        cfg["last_price"] = price_cur
+                        cfg["last_volume_m5"] = vol_m5_cur
+                        cfg["last_mcap"] = mcap_cur
+                        cfg["last_ts"] = time.time()
+
+            await asyncio.sleep(5)
+
+        except Exception as e:
+            logger.error(f"Критическая ошибка market_watcher: {e}")
+            await asyncio.sleep(10)
+
+
+async def post_init(app: Application):
+    logger.info("post_init: запускаем market_watcher в фоне")
+    asyncio.create_task(market_watcher(app))
+
+
+# ------------ MAIN ------------
+
+def main():
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN не найден. Проверь переменную окружения.")
+        raise SystemExit("BOT_TOKEN is missing")
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("price", price))
+    app.add_handler(CommandHandler("watchlist", watchlist))
+    app.add_handler(CommandHandler("unwatch", unwatch))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(button_callback))
+
+    logger.info("Бот запущен, начинаем polling…")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()

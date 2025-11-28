@@ -36,27 +36,29 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # tracked_tokens[address] = {
-#   "symbol": str | None,
-#   "chain": str | None,
-#   "subscribers": {
-#       user_id: {
-#           "vol_threshold": float | None,
-#           "price_threshold": float | None,
-#           "mcap_threshold": float | None,
-#           "last_price": float | None,
-#           "last_volume_m5": float | None,
-#           "last_mcap": float | None,
-#           "last_ts": float | None,
-#       }
-#   }
+#     "symbol": str | None,
+#     "chain": str | None,
+#     "subscribers": {
+#         user_id: {
+#             "vol_threshold": float | None,
+#             "price_threshold": float | None,
+#             "mcap_threshold": float | None,
+#             "last_price": float | None,
+#             "last_volume_m5": float | None,
+#             "last_mcap": float | None,
+#             "last_ts": float | None,
+#         }
+#     }
 # }
+
 tracked_tokens: dict[str, dict] = {}
 
 # pending_threshold_input[user_id] = {
-#   "pending_volume_for": address | None,
-#   "pending_price_for": address | None,
-#   "pending_mcap_for": address | None,
+#     "pending_volume_for": address | None,
+#     "pending_price_for": address | None,
+#     "pending_mcap_for": address | None,
 # }
+
 pending_threshold_input: dict[int, dict] = {}
 
 
@@ -85,12 +87,15 @@ def format_addr_with_meta(address: str, info: dict | None) -> str:
     chain = map_chain(info.get("chain")) if info else "Unknown"
     base = address
     meta = []
+
     if symbol:
         meta.append(symbol)
     if chain:
         meta.append(chain)
+
     if not meta:
         return base
+
     return f"{base} ({', '.join(meta)})"
 
 
@@ -103,6 +108,7 @@ def pct_change(new: float | None, old: float | None) -> float | None:
 def ensure_subscriber(info: dict, user_id: int) -> dict:
     subs = info.setdefault("subscribers", {})
     sub = subs.get(user_id)
+
     if not sub:
         sub = {
             "vol_threshold": None,
@@ -114,6 +120,7 @@ def ensure_subscriber(info: dict, user_id: int) -> dict:
             "last_ts": None,
         }
         subs[user_id] = sub
+
     return sub
 
 
@@ -164,10 +171,12 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "?ids=bitcoin&vs_currencies=usd"
             ) as resp:
                 data = await resp.json()
+
         btc_price = data["bitcoin"]["usd"]
         await update.message.reply_text(
             f"₿ Bitcoin: ${btc_price:,}", reply_markup=main_menu_keyboard()
         )
+
     except Exception as e:
         logger.error(f"Ошибка /price: {e}")
         await update.message.reply_text("❌ Ошибка получения цены BTC")
@@ -184,9 +193,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "📋 Watchlist":
         await watchlist(update, context)
         return
+
     if text == "❓ Помощь":
         await help_cmd(update, context)
         return
+
     if text == "➕ Отслеживать токен":
         await update.message.reply_text(
             "Отправь адрес контракта токена, который хочешь отслеживать.",
@@ -335,7 +346,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         async with aiohttp.ClientSession() as session:
             raw = await get_token_pairs_by_address(session, address)
-        pair = pick_best_pair(raw)
+            pair = pick_best_pair(raw)
+
     except Exception as e:
         logger.error(f"Ошибка запроса токена {address}: {e}")
         await update.message.reply_text(
@@ -351,11 +363,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     price_cur = float(pair.get("priceUsd", 0) or 0)
+
     volume_info = pair.get("volume") or {}
     vol_m5_cur = float(volume_info.get("m5", 0) or 0)
     vol_24h_cur = float(volume_info.get("h24", 0) or 0)
+
     mcap_cur = float(pair.get("marketCap") or pair.get("mcap") or 0)
     fdv = float(pair.get("fdv") or 0)
+
     if not mcap_cur and fdv:
         mcap_cur = fdv
 
@@ -405,9 +420,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     )
 
-    await update.message.reply_text(
-        text_resp, reply_markup=keyboard,
-    )
+    await update.message.reply_text(text_resp, reply_markup=keyboard)
 
 
 # ------------ КНОПКИ ------------
@@ -415,8 +428,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
     data = query.data or ""
     user_id = query.from_user.id
+
     logger.info(f"BTN от {user_id}: {data}")
 
     state = pending_threshold_input.get(user_id) or {
@@ -425,17 +440,149 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "pending_mcap_for": None,
     }
 
-    # Подписка
+    # ============ ДЕТАЛЬНОЕ МЕНЮ ТОКЕНА ИЗ WATCHLIST ============
+    if data.startswith("menu:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text(
+                "⚠️ Этот токен больше не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        sub = info["subscribers"][user_id]
+        label = format_addr_with_meta(address, info)
+
+        vt = sub.get("vol_threshold")
+        pt = sub.get("price_threshold")
+        mt = sub.get("mcap_threshold")
+
+        status_lines = []
+        if pt is not None:
+            status_lines.append(f"📈 Цена: {pt:.1f}%")
+        else:
+            status_lines.append("📈 Цена: ⛔")
+
+        if mt is not None:
+            status_lines.append(f"🏦 Капа: {mt:.1f}%")
+        else:
+            status_lines.append("🏦 Капа: ⛔")
+
+        if vt is not None:
+            status_lines.append(f"🛰 Объём: {vt:.1f}%")
+        else:
+            status_lines.append("🛰 Объём: ⛔")
+
+        text = f"📌 {label}\n\n" + "\n".join(status_lines)
+
+        # Кнопки отключения параметров
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "❌ Цена", callback_data=f"disable_price:{address}"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Капа", callback_data=f"disable_mcap:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "❌ Объём", callback_data=f"disable_vol:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📌 Оставить в списке", callback_data=f"pin:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🛑 Удалить полностью", callback_data=f"delete:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад", callback_data="back_to_watchlist"
+                    ),
+                ],
+            ]
+        )
+
+        await query.edit_message_text(text=text, reply_markup=keyboard)
+        return
+
+    # ============ ОБНУЛЕНИЕ ПОРОГОВ ============
+    if data.startswith("pin:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text("⚠️ Токен не найден.")
+            return
+
+        sub = info["subscribers"][user_id]
+        sub["vol_threshold"] = None
+        sub["price_threshold"] = None
+        sub["mcap_threshold"] = None
+
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"📌 {label} остался в списке, но все пороги сброшены.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # ============ УДАЛЕНИЕ ТОКЕНА ============
+    if data.startswith("delete:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text("⚠️ Токен не найден.")
+            return
+
+        label = format_addr_with_meta(address, info)
+        info["subscribers"].pop(user_id, None)
+
+        if not info["subscribers"]:
+            tracked_tokens.pop(address, None)
+
+        state = pending_threshold_input.get(user_id)
+        if state:
+            if state.get("pending_volume_for") == address:
+                state["pending_volume_for"] = None
+            if state.get("pending_price_for") == address:
+                state["pending_price_for"] = None
+            if state.get("pending_mcap_for") == address:
+                state["pending_mcap_for"] = None
+            pending_threshold_input[user_id] = state
+
+        await query.message.reply_text(
+            f"🛑 {label} удален из Watchlist.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # ============ НАЗАД В WATCHLIST ============
+    if data == "back_to_watchlist":
+        await watchlist(update, context)
+        return
+
+    # ============ ПОДПИСКА НА ОТСЛЕЖИВАНИЕ ============
     if data.startswith("track_"):
         if data.startswith("track_vol:"):
             address = data.split(":", 1)[1]
             info = tracked_tokens.setdefault(
-                address,
-                {"symbol": None, "chain": None, "subscribers": {}},
+                address, {"symbol": None, "chain": None, "subscribers": {}}
             )
+
             ensure_subscriber(info, user_id)
             state["pending_volume_for"] = address
             pending_threshold_input[user_id] = state
+
             await query.edit_message_reply_markup(reply_markup=None)
             label = format_addr_with_meta(address, info)
             await query.message.reply_text(
@@ -448,12 +595,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("track_price:"):
             address = data.split(":", 1)[1]
             info = tracked_tokens.setdefault(
-                address,
-                {"symbol": None, "chain": None, "subscribers": {}},
+                address, {"symbol": None, "chain": None, "subscribers": {}}
             )
+
             ensure_subscriber(info, user_id)
             state["pending_price_for"] = address
             pending_threshold_input[user_id] = state
+
             await query.edit_message_reply_markup(reply_markup=None)
             label = format_addr_with_meta(address, info)
             await query.message.reply_text(
@@ -466,12 +614,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("track_mcap:"):
             address = data.split(":", 1)[1]
             info = tracked_tokens.setdefault(
-                address,
-                {"symbol": None, "chain": None, "subscribers": {}},
+                address, {"symbol": None, "chain": None, "subscribers": {}}
             )
+
             ensure_subscriber(info, user_id)
             state["pending_mcap_for"] = address
             pending_threshold_input[user_id] = state
+
             await query.edit_message_reply_markup(reply_markup=None)
             label = format_addr_with_meta(address, info)
             await query.message.reply_text(
@@ -481,10 +630,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # Отключение из алерта
+    # ============ ОТКЛЮЧЕНИЕ ИЗ АЛЕРТА ============
     if data.startswith("disable_"):
         prefix, address = data.split(":", 1)
         kind = prefix.replace("disable_", "")
+
         info = tracked_tokens.get(address)
         if not info:
             await query.message.reply_text(
@@ -495,6 +645,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         subs = info.get("subscribers", {})
         sub = subs.get(user_id)
+
         if not sub:
             await query.message.reply_text(
                 "⚠️ Подписка для этого токена уже снята.",
@@ -510,42 +661,48 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ Отключены алерты цены для {label}.",
                 reply_markup=main_menu_keyboard(),
             )
+
         elif kind == "mcap":
             sub["mcap_threshold"] = None
             await query.message.reply_text(
                 f"✅ Отключены алерты капы для {label}.",
                 reply_markup=main_menu_keyboard(),
             )
+
         elif kind == "vol":
             sub["vol_threshold"] = None
             await query.message.reply_text(
                 f"✅ Отключены алерты объёма для {label}.",
                 reply_markup=main_menu_keyboard(),
             )
+
         elif kind == "all":
             subs.pop(user_id, None)
             if not subs:
                 tracked_tokens.pop(address, None)
+
             await query.message.reply_text(
                 f"🛑 Полностью отключено отслеживание {label}.",
                 reply_markup=main_menu_keyboard(),
             )
 
-        return
 
-
-# ------------ СПИСОК / ОТКЛЮЧЕНИЕ ------------
+# ------------ СПИСОК / ОТКЛЮЧЕНИЕ / УПРАВЛЕНИЕ WATCHLIST ------------
 
 async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Интерактивный Watchlist с меню для каждого токена"""
     user_id = update.effective_user.id
-    rows = []
+
+    items = []
     for address, info in tracked_tokens.items():
         sub = info.get("subscribers", {}).get(user_id)
         if not sub:
             continue
+
         vt = sub.get("vol_threshold")
         pt = sub.get("price_threshold")
         mt = sub.get("mcap_threshold")
+
         parts = []
         if pt is not None:
             parts.append(f"price ≥ {pt:.1f}%")
@@ -555,29 +712,45 @@ async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parts.append(f"vol ≥ {vt:.1f}%")
         if not parts:
             parts.append("параметры отключены")
-        label = format_addr_with_meta(address, info)
-        rows.append(f"{label} ({', '.join(parts)})")
 
-    if not rows:
+        label = format_addr_with_meta(address, info)
+        items.append((address, label, parts))
+
+    if not items:
         await update.message.reply_text(
             "👀 Сейчас ты ничего не отслеживаешь.",
             reply_markup=main_menu_keyboard(),
         )
         return
 
-    text = "🛰 Ты отслеживаешь:\n" + "\n".join(f"- {row}" for row in rows)
-    await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+    # Строим кнопки для каждого токена
+    keyboard_buttons = []
+    for address, label, parts in items:
+        symbol = label.split()[0][:8]
+        params = ", ".join(parts[:2])
+        btn_text = f"{symbol}… ({params})"
+        keyboard_buttons.append(
+            [InlineKeyboardButton(btn_text, callback_data=f"menu:{address}")]
+        )
+
+    keyboard = InlineKeyboardMarkup(keyboard_buttons)
+
+    text = "🛰 Твой Watchlist:\n\nНажми на токен для меню управления:"
+    await update.message.reply_text(text, reply_markup=keyboard)
 
 
 async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+
     if not context.args:
         await update.message.reply_text(
             "Используй: /unwatch <адрес_контракта>",
             reply_markup=main_menu_keyboard(),
         )
         return
+
     address = context.args[0].strip()
+
     info = tracked_tokens.get(address)
     if not info or user_id not in info.get("subscribers", {}):
         await update.message.reply_text(
@@ -585,9 +758,12 @@ async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_menu_keyboard(),
         )
         return
+
     info["subscribers"].pop(user_id, None)
+
     if not info["subscribers"]:
         tracked_tokens.pop(address, None)
+
     state = pending_threshold_input.get(user_id)
     if state:
         if state.get("pending_volume_for") == address:
@@ -597,6 +773,7 @@ async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if state.get("pending_mcap_for") == address:
             state["pending_mcap_for"] = None
         pending_threshold_input[user_id] = state
+
     label = format_addr_with_meta(address, info or {})
     await update.message.reply_text(
         f"✅ Отключил отслеживание для {label}.",
@@ -608,6 +785,7 @@ async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def market_watcher(app: Application):
     logger.info("🚀 Market watcher запущен")
+
     while True:
         try:
             if not tracked_tokens:
@@ -617,12 +795,14 @@ async def market_watcher(app: Application):
             async with aiohttp.ClientSession() as session:
                 for address, info in list(tracked_tokens.items()):
                     subs = info.get("subscribers") or {}
+
                     if not subs:
                         continue
 
                     try:
                         raw = await get_token_pairs_by_address(session, address)
                         pair = pick_best_pair(raw)
+
                     except Exception as e:
                         logger.error(f"Ошибка обновления токена {address[:8]}: {e}")
                         continue
@@ -632,10 +812,13 @@ async def market_watcher(app: Application):
                         continue
 
                     price_cur = float(pair.get("priceUsd", 0) or 0)
+
                     volume_info = pair.get("volume") or {}
                     vol_m5_cur = float(volume_info.get("m5", 0) or 0)
+
                     mcap_cur = float(pair.get("marketCap") or pair.get("mcap") or 0)
                     fdv = float(pair.get("fdv") or 0)
+
                     if not mcap_cur and fdv:
                         mcap_cur = fdv
 
@@ -664,17 +847,33 @@ async def market_watcher(app: Application):
                         reason_lines = []
 
                         # приоритет: цена, капитализация, объём
-                        if pt is not None and price_delta is not None and abs(price_delta) >= pt:
+                        if (
+                            pt is not None
+                            and price_delta is not None
+                            and abs(price_delta) >= pt
+                        ):
                             direction = "⬆️" if price_delta > 0 else "⬇️"
                             reason_lines.append(f"{direction} Цена: {price_delta:.2f}%")
                             triggered = True
 
-                        if not triggered and mt is not None and mcap_delta is not None and abs(mcap_delta) >= mt:
+                        if (
+                            not triggered
+                            and mt is not None
+                            and mcap_delta is not None
+                            and abs(mcap_delta) >= mt
+                        ):
                             direction = "⬆️" if mcap_delta > 0 else "⬇️"
-                            reason_lines.append(f"{direction} Капитализация: {mcap_delta:.2f}%")
+                            reason_lines.append(
+                                f"{direction} Капитализация: {mcap_delta:.2f}%"
+                            )
                             triggered = True
 
-                        if not triggered and vt is not None and vol_delta is not None and abs(vol_delta) >= vt:
+                        if (
+                            not triggered
+                            and vt is not None
+                            and vol_delta is not None
+                            and abs(vol_delta) >= vt
+                        ):
                             direction = "⬆️" if vol_delta > 0 else "⬇️"
                             reason_lines.append(f"{direction} Объём m5: {vol_delta:.2f}%")
                             triggered = True
@@ -692,6 +891,7 @@ async def market_watcher(app: Application):
                             extra_lines.append(f"Объём m5: {vol_delta:+.2f}%")
 
                         label = format_addr_with_meta(address, info)
+
                         msg = (
                             f"🚨 {symbol}\n{label}\n\n"
                             f"{'; '.join(reason_lines)}\n\n"
@@ -735,7 +935,9 @@ async def market_watcher(app: Application):
                                 reply_markup=keyboard,
                                 parse_mode="Markdown",
                             )
+
                             logger.info(f"Алёрт отправлен {uid} для {address[:8]}")
+
                         except Exception as e:
                             logger.error(f"Ошибка отправки алерта {uid}: {e}")
 

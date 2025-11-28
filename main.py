@@ -834,6 +834,385 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(text_resp, reply_markup=keyboard, parse_mode="Markdown")
+# ------------ КНОПКИ ВЫБОРА ПАРАМЕТРОВ ============
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    
+    data = query.data or ""
+    user_id = query.from_user.id
+
+    logger.info(f"BTN от {user_id}: {data}")
+
+    # ============ ВСПЛЫВАЮЩИЕ ПОДСКАЗКИ (TOOLTIPS) ============
+    tooltips = {
+        "select_all": "✅ Включить все три параметра",
+        "select_price": "📈 Отслеживать изменение цены",
+        "select_mcap": "🏦 Отслеживать капитализацию",
+        "select_vol": "🛰 Отслеживать объём m5",
+        "menu": "👁️ Управление параметрами",
+        "menu_disabled": "🔄 Активировать параметры",
+        "disable_price": "❌ Отключить цену",
+        "disable_mcap": "❌ Отключить капу",
+        "disable_vol": "❌ Отключить объём",
+        "delete": "🗑️ Удалить из списка",
+        "pin": "📌 Оставить в списке",
+        "back_to_watchlist": "⬅️ Вернуться в Watchlist",
+    }
+
+    # Определяем тип кнопки для tooltip
+    tooltip_key = None
+    for key in tooltips:
+        if data.startswith(key):
+            tooltip_key = key
+            break
+    
+    if tooltip_key:
+        await query.answer(tooltips[tooltip_key], show_alert=False)
+    else:
+        await query.answer()
+
+    state = pending_threshold_input.get(user_id) or {
+        "pending_volume_for": None,
+        "pending_price_for": None,
+        "pending_mcap_for": None,
+        "pending_multi": None,
+        "multi_params": [],
+        "multi_step": 0,
+    }
+
+    # ============ ВЫБОР ВСЕХ ТРЁХ ПАРАМЕТРОВ ============
+    if data.startswith("select_all:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_multi"] = address
+        state["multi_params"] = ["price", "mcap", "vol"]
+        state["multi_step"] = 0
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"📈 Введи порог изменения цены в % для {label}.\n"
+            f"Например: 5",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # ============ ВЫБОР ОДНОГО ПАРАМЕТРА ============
+    if data.startswith("select_price:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_price_for"] = address
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"📈 Введи порог изменения цены в % для {label}.\n"
+            f"Например: 5",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    if data.startswith("select_mcap:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_mcap_for"] = address
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"🏦 Введи порог изменения капитализации в % для {label}.\n"
+            f"Например: 10",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    if data.startswith("select_vol:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_volume_for"] = address
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"🛰 Введи порог изменения объёма m5 в % для {label}.\n"
+            f"Например: 20",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # ============ МЕНЮ ОТКЛЮЧЁННОГО ТОКЕНА (В СПИСКЕ) ============
+    if data.startswith("menu_disabled:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text(
+                "⚠️ Этот токен больше не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        symbol = info.get("symbol", "")
+        short_address = short_addr(address)
+
+        text = (
+            f"📌 {symbol} {short_address}\n\n"
+            f"⛔ Отслеживание отключено\n\n"
+            f"Выбери параметры для подключения:"
+        )
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "📈 Цена", callback_data=f"select_price:{address}"
+                    ),
+                    InlineKeyboardButton(
+                        "🏦 Капа", callback_data=f"select_mcap:{address}"
+                    ),
+                    InlineKeyboardButton(
+                        "🛰 Объём", callback_data=f"select_vol:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✅ Все три", callback_data=f"select_all:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🛑 Удалить из списка", callback_data=f"delete:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад", callback_data="back_to_watchlist"
+                    ),
+                ],
+            ]
+        )
+
+        await query.edit_message_text(text=text, reply_markup=keyboard)
+        return
+
+    # ============ ДЕТАЛЬНОЕ МЕНЮ ТОКЕНА ИЗ WATCHLIST ============
+    if data.startswith("menu:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text(
+                "⚠️ Этот токен больше не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        sub = info["subscribers"][user_id]
+        symbol = info.get("symbol", "")
+        short_address = short_addr(address)
+
+        vt = sub.get("vol_threshold")
+        pt = sub.get("price_threshold")
+        mt = sub.get("mcap_threshold")
+
+        status_lines = [f"📌 **{symbol}** {short_address}"]
+        status_lines.append("")
+        status_lines.append("**ПАРАМЕТРЫ:**")
+        
+        if pt is not None:
+            status_lines.append(f"✅ 📈 Цена: {pt:.1f}%")
+        else:
+            status_lines.append(f"⛔ 📈 Цена: отключена")
+
+        if mt is not None:
+            status_lines.append(f"✅ 🏦 Капа: {mt:.1f}%")
+        else:
+            status_lines.append(f"⛔ 🏦 Капа: отключена")
+
+        if vt is not None:
+            status_lines.append(f"✅ 🛰 Объём: {vt:.1f}%")
+        else:
+            status_lines.append(f"⛔ 🛰 Объём: отключен")
+
+        # Анализ памп/дамп
+        pump_dump = detect_pump_dump(sub.get("volume_history", deque()))
+        if pump_dump:
+            status_lines.append("")
+            status_lines.append(f"⚡ {pump_dump}")
+
+        text = "\n".join(status_lines)
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "❌ Цена", callback_data=f"disable_price:{address}"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Капа", callback_data=f"disable_mcap:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "❌ Объём", callback_data=f"disable_vol:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📌 Оставить в списке", callback_data=f"pin:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🛑 Удалить полностью", callback_data=f"delete:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад", callback_data="back_to_watchlist"
+                    ),
+                ],
+            ]
+        )
+
+        await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+        return
+
+    # ============ ОБНУЛЕНИЕ ПОРОГОВ ============
+    if data.startswith("pin:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text("⚠️ Токен не найден.")
+            return
+
+        sub = info["subscribers"][user_id]
+        sub["vol_threshold"] = None
+        sub["price_threshold"] = None
+        sub["mcap_threshold"] = None
+
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"📌 {label} остался в списке, но все пороги сброшены.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # ============ УДАЛЕНИЕ ТОКЕНА ============
+    if data.startswith("delete:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text("⚠️ Токен не найден.")
+            return
+
+        label = format_addr_with_meta(address, info)
+        info["subscribers"].pop(user_id, None)
+
+        if not info["subscribers"]:
+            tracked_tokens.pop(address, None)
+
+        state = pending_threshold_input.get(user_id)
+        if state:
+            if state.get("pending_volume_for") == address:
+                state["pending_volume_for"] = None
+            if state.get("pending_price_for") == address:
+                state["pending_price_for"] = None
+            if state.get("pending_mcap_for") == address:
+                state["pending_mcap_for"] = None
+            if state.get("pending_multi") == address:
+                state["pending_multi"] = None
+            pending_threshold_input[user_id] = state
+
+        await query.message.reply_text(
+            f"🛑 {label} удален из Watchlist.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # ============ НАЗАД В WATCHLIST ============
+    if data == "back_to_watchlist":
+        await watchlist(update, context)
+        return
+
+    # ============ ОТКЛЮЧЕНИЕ ИЗ АЛЕРТА ============
+    if data.startswith("disable_"):
+        prefix, address = data.split(":", 1)
+        kind = prefix.replace("disable_", "")
+
+        info = tracked_tokens.get(address)
+        if not info:
+            await query.message.reply_text(
+                "⚠️ Этот токен уже не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        subs = info.get("subscribers", {})
+        sub = subs.get(user_id)
+
+        if not sub:
+            await query.message.reply_text(
+                "⚠️ Подписка для этого токена уже снята.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        label = format_addr_with_meta(address, info)
+
+        if kind == "price":
+            sub["price_threshold"] = None
+            await query.message.reply_text(
+                f"✅ Отключены алерты цены для {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
+
+        elif kind == "mcap":
+            sub["mcap_threshold"] = None
+            await query.message.reply_text(
+                f"✅ Отключены алерты капы для {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
+
+        elif kind == "vol":
+            sub["vol_threshold"] = None
+            await query.message.reply_text(
+                f"✅ Отключены алерты объёма для {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
+
+        elif kind == "all":
+            subs.pop(user_id, None)
+            if not subs:
+                tracked_tokens.pop(address, None)
+
+            await query.message.reply_text(
+                f"🛑 Полностью отключено отслеживание {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
 
 
 # ============ ФУНКЦИЯ ОБНОВЛЕНИЯ БАЛАНСА ============
@@ -882,199 +1261,429 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     logger.info(f"BTN от {user_id}: {data}")
+
+    # если дальше есть tooltips – можно вставить сюда, а затем:
     await query.answer()
 
     # ============ ПОРТФЕЛЬ CALLBACKS ============
-    
+
     if data == "portfolio:add":
         keyboard = ReplyKeyboardMarkup(
             [[KeyboardButton("Отмена")]],
             resize_keyboard=True,
             one_time_keyboard=True
         )
-        
+
         await query.message.reply_text(
             "📍 Отправь адрес кошелька (Solana, Ethereum, Base или BSC):",
             reply_markup=keyboard
         )
-        
+
         pending_wallet_input[user_id] = {"step": "address"}
         return
-    
+
     if data == "portfolio:view":
         await view_portfolio_full(update, context)
         return
-    
+
     if data == "portfolio:refresh":
         user_data = get_user_wallets(user_id)
         wallets = user_data.get("wallets", {})
-        
+
         if not wallets:
             await query.message.reply_text("💼 Портфель пуст!")
             return
-        
+
         await query.message.reply_text("🔄 Обновляю балансы... (это может занять 30 сек)")
-        
+
         for wallet_id in wallets:
             await update_wallet_balance(user_id, wallet_id)
-        
+
         await view_portfolio_full(update, context)
         return
-    
+
     if data == "portfolio:back":
         await show_portfolio_menu(update, context)
         return
-    
+
     if data == "portfolio:delete":
         user_data = get_user_wallets(user_id)
         wallets = user_data.get("wallets", {})
-        
+
         if not wallets:
             await query.message.reply_text("💼 Нет кошельков для удаления!")
             return
-        
-        # Строим кнопки для удаления
+
         keyboard = []
         for wallet_id, wallet_info in wallets.items():
             name = wallet_info.get("name", "")
-            keyboard.append([InlineKeyboardButton(f"🗑️ {name}", callback_data=f"wallet_delete:{wallet_id}")])
-        
+            keyboard.append(
+                [InlineKeyboardButton(f"🗑️ {name}", callback_data=f"wallet_delete:{wallet_id}")]
+            )
+
         keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="portfolio:back")])
-        
+
         await query.edit_message_text(
             text="🗑️ Выбери кошелек для удаления:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
-    
+
     if data.startswith("wallet_delete:"):
         wallet_id = data.split(":", 1)[1]
         user_data = get_user_wallets(user_id)
-        
+
         if wallet_id in user_data["wallets"]:
             del user_data["wallets"][wallet_id]
             save_data()
             await query.message.reply_text("✅ Кошелек удален!")
-        
+
         await show_portfolio_menu(update, context)
         return
 
-    # ============ WATCHLIST CALLBACKS (остаётся старый код) ============
-    # ... (остальной код для select_price, select_mcap и т.д.)
+    # ============ WATCHLIST CALLBACKS ============
 
+    state = pending_threshold_input.get(user_id) or {
+        "pending_volume_for": None,
+        "pending_price_for": None,
+        "pending_mcap_for": None,
+        "pending_multi": None,
+        "multi_params": [],
+        "multi_step": 0,
+    }
 
-# ============ WATCHLIST ============
+    # ВСЕ ТРИ ПАРАМЕТРА
+    if data.startswith("select_all:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
 
-async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Просмотр Watchlist"""
-    user_id = update.effective_user.id
+        ensure_subscriber(info, user_id)
+        state["pending_multi"] = address
+        state["multi_params"] = ["price", "mcap", "vol"]
+        state["multi_step"] = 0
+        pending_threshold_input[user_id] = state
 
-    items_active = []
-    items_disabled = []
-    
-    for address, info in tracked_tokens.items():
-        sub = info.get("subscribers", {}).get(user_id)
-        if not sub:
-            continue
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"📈 Введи порог изменения цены в % для {label}.\n"
+            f"Например: 5",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # ОТДЕЛЬНЫЕ ПАРАМЕТРЫ
+    if data.startswith("select_price:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_price_for"] = address
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"📈 Введи порог изменения цены в % для {label}.\n"
+            f"Например: 5",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    if data.startswith("select_mcap:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_mcap_for"] = address
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"🏦 Введи порог изменения капитализации в % для {label}.\n"
+            f"Например: 10",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    if data.startswith("select_vol:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_volume_for"] = address
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"🛰 Введи порог изменения объёма m5 в % для {label}.\n"
+            f"Например: 20",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # МЕНЮ ОТКЛЮЧЁННОГО ТОКЕНА
+    if data.startswith("menu_disabled:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text(
+                "⚠️ Этот токен больше не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        symbol = info.get("symbol", "")
+        short_address = short_addr(address)
+
+        text = (
+            f"📌 {symbol} {short_address}\n\n"
+            f"⛔ Отслеживание отключено\n\n"
+            f"Выбери параметры для подключения:"
+        )
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "📈 Цена", callback_data=f"select_price:{address}"
+                    ),
+                    InlineKeyboardButton(
+                        "🏦 Капа", callback_data=f"select_mcap:{address}"
+                    ),
+                    InlineKeyboardButton(
+                        "🛰 Объём", callback_data=f"select_vol:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✅ Все три", callback_data=f"select_all:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🛑 Удалить из списка", callback_data=f"delete:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад", callback_data="back_to_watchlist"
+                    ),
+                ],
+            ]
+        )
+
+        await query.edit_message_text(text=text, reply_markup=keyboard)
+        return
+
+    # МЕНЮ АКТИВНОГО ТОКЕНА
+    if data.startswith("menu:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text(
+                "⚠️ Этот токен больше не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        sub = info["subscribers"][user_id]
+        symbol = info.get("symbol", "")
+        short_address = short_addr(address)
 
         vt = sub.get("vol_threshold")
         pt = sub.get("price_threshold")
         mt = sub.get("mcap_threshold")
 
-        symbol = info.get("symbol", "")
-        short_address = short_addr(address)
-
-        has_active = pt is not None or mt is not None or vt is not None
-
-        if has_active:
-            parts = []
-            if pt is not None:
-                parts.append(f"📈 {pt:.1f}%")
-            if mt is not None:
-                parts.append(f"🏦 {mt:.1f}%")
-            if vt is not None:
-                parts.append(f"🛰 {vt:.1f}%")
-            
-            params = " ".join(parts)
-            btn_text = f"{symbol} {short_address} {params}"
-            items_active.append((address, btn_text, "menu"))
+        status_lines = [f"📌 **{symbol}** {short_address}"]
+        status_lines.append("")
+        status_lines.append("**ПАРАМЕТРЫ:**")
+        
+        if pt is not None:
+            status_lines.append(f"✅ 📈 Цена: {pt:.1f}%")
         else:
-            btn_text = f"{symbol} {short_address} ⛔"
-            items_disabled.append((address, btn_text, "menu_disabled"))
+            status_lines.append(f"⛔ 📈 Цена: отключена")
 
-    if not items_active and not items_disabled:
-        await update.message.reply_text(
-            "👀 Сейчас ты ничего не отслеживаешь.",
+        if mt is not None:
+            status_lines.append(f"✅ 🏦 Капа: {mt:.1f}%")
+        else:
+            status_lines.append(f"⛔ 🏦 Капа: отключена")
+
+        if vt is not None:
+            status_lines.append(f"✅ 🛰 Объём: {vt:.1f}%")
+        else:
+            status_lines.append(f"⛔ 🛰 Объём: отключен")
+
+        pump_dump = detect_pump_dump(sub.get("volume_history", deque()))
+        if pump_dump:
+            status_lines.append("")
+            status_lines.append(f"⚡ {pump_dump}")
+
+        text = "\n".join(status_lines)
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "❌ Цена", callback_data=f"disable_price:{address}"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Капа", callback_data=f"disable_mcap:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "❌ Объём", callback_data=f"disable_vol:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📌 Оставить в списке", callback_data=f"pin:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🛑 Удалить полностью", callback_data=f"delete:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад", callback_data="back_to_watchlist"
+                    ),
+                ],
+            ]
+        )
+
+        await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+        return
+
+    # СБРОС ПОРОГОВ
+    if data.startswith("pin:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text("⚠️ Токен не найден.")
+            return
+
+        sub = info["subscribers"][user_id]
+        sub["vol_threshold"] = None
+        sub["price_threshold"] = None
+        sub["mcap_threshold"] = None
+
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"📌 {label} остался в списке, но все пороги сброшены.",
             reply_markup=main_menu_keyboard(),
         )
         return
 
-    keyboard_buttons = []
-    
-    if items_active:
-        keyboard_buttons.append([InlineKeyboardButton("🟢 АКТИВНЫЕ", callback_data="noop")])
-        for address, btn_text, callback_prefix in items_active:
-            keyboard_buttons.append(
-                [InlineKeyboardButton(btn_text, callback_data=f"{callback_prefix}:{address}")]
+    # УДАЛЕНИЕ ТОКЕНА
+    if data.startswith("delete:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text("⚠️ Токен не найден.")
+            return
+
+        label = format_addr_with_meta(address, info)
+        info["subscribers"].pop(user_id, None)
+
+        if not info["subscribers"]:
+            tracked_tokens.pop(address, None)
+
+        state = pending_threshold_input.get(user_id)
+        if state:
+            if state.get("pending_volume_for") == address:
+                state["pending_volume_for"] = None
+            if state.get("pending_price_for") == address:
+                state["pending_price_for"] = None
+            if state.get("pending_mcap_for") == address:
+                state["pending_mcap_for"] = None
+            if state.get("pending_multi") == address:
+                state["pending_multi"] = None
+            pending_threshold_input[user_id] = state
+
+        await query.message.reply_text(
+            f"🛑 {label} удален из Watchlist.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # НАЗАД В WATCHLIST
+    if data == "back_to_watchlist":
+        await watchlist(update, context)
+        return
+
+    # ОТКЛЮЧЕНИЕ ПАРАМЕТРОВ ИЗ АЛЕРТА
+    if data.startswith("disable_"):
+        prefix, address = data.split(":", 1)
+        kind = prefix.replace("disable_", "")
+
+        info = tracked_tokens.get(address)
+        if not info:
+            await query.message.reply_text(
+                "⚠️ Этот токен уже не отслеживается.",
+                reply_markup=main_menu_keyboard(),
             )
-    
-    if items_disabled:
-        if items_active:
-            keyboard_buttons.append([InlineKeyboardButton("⚫ БЕЗ АЛЕРТОВ", callback_data="noop")])
-        for address, btn_text, callback_prefix in items_disabled:
-            keyboard_buttons.append(
-                [InlineKeyboardButton(btn_text, callback_data=f"{callback_prefix}:{address}")]
+            return
+
+        subs = info.get("subscribers", {})
+        sub = subs.get(user_id)
+
+        if not sub:
+            await query.message.reply_text(
+                "⚠️ Подписка для этого токена уже снята.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        label = format_addr_with_meta(address, info)
+
+        if kind == "price":
+            sub["price_threshold"] = None
+            await query.message.reply_text(
+                f"✅ Отключены алерты цены для {label}.",
+                reply_markup=main_menu_keyboard(),
             )
 
-    keyboard = InlineKeyboardMarkup(keyboard_buttons)
+        elif kind == "mcap":
+            sub["mcap_threshold"] = None
+            await query.message.reply_text(
+                f"✅ Отключены алерты капы для {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
 
-    text = "🛰 **Твой Watchlist:**\n\nНажми на токен для управления:"
-    await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        elif kind == "vol":
+            sub["vol_threshold"] = None
+            await query.message.reply_text(
+                f"✅ Отключены алерты объёма для {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
 
+        elif kind == "all":
+            subs.pop(user_id, None)
+            if not subs:
+                tracked_tokens.pop(address, None)
 
-async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удалить токен из watchlist"""
-    user_id = update.effective_user.id
+            await query.message.reply_text(
+                f"🛑 Полностью отключено отслеживание {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
 
-    if not context.args:
-        await update.message.reply_text(
-            "Используй: /unwatch <адрес_контракта>",
-            reply_markup=main_menu_keyboard(),
-        )
-        return
-
-    address = context.args[0].strip()
-
-    info = tracked_tokens.get(address)
-    if not info or user_id not in info.get("subscribers", {}):
-        await update.message.reply_text(
-            "❌ Этот адрес ты сейчас не отслеживаешь.",
-            reply_markup=main_menu_keyboard(),
-        )
-        return
-
-    info["subscribers"].pop(user_id, None)
-
-    if not info["subscribers"]:
-        tracked_tokens.pop(address, None)
-
-    state = pending_threshold_input.get(user_id)
-    if state:
-        if state.get("pending_volume_for") == address:
-            state["pending_volume_for"] = None
-        if state.get("pending_price_for") == address:
-            state["pending_price_for"] = None
-        if state.get("pending_mcap_for") == address:
-            state["pending_mcap_for"] = None
-        if state.get("pending_multi") == address:
-            state["pending_multi"] = None
-        pending_threshold_input[user_id] = state
-
-    label = format_addr_with_meta(address, info or {})
-    await update.message.reply_text(
-        f"✅ Отключил отслеживание для {label}.",
-        reply_markup=main_menu_keyboard(),
-    )
 
 
 # ============ ФОНОВЫЙ МОНИТОР ============

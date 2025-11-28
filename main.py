@@ -8,6 +8,8 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 from telegram.ext import (
     Application,
@@ -115,6 +117,17 @@ def ensure_subscriber(info: dict, user_id: int) -> dict:
     return sub
 
 
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("➕ Отслеживать токен")],
+            [KeyboardButton("📋 Watchlist"), KeyboardButton("❓ Помощь")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
 # ------------ КОМАНДЫ ------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -124,13 +137,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1) Отправь адрес токена (Sol/ETH/Base/BNB).\n"
         "2) Нажми кнопку отслеживания цены / объёма / капы.\n"
         "3) Введи порог в %.\n\n"
-        "При срабатывании порога бот присылает:\n"
-        "- фактические цену, объём m5 и капитализацию;\n"
-        "- процент изменения каждого параметра от предыдущего состояния.\n\n"
-        "В алерте будут кнопки отключения: цены, капы, объёма или всего сразу.\n\n"
         "/watchlist — текущие подписки\n"
         "/unwatch <адрес> — убрать токен\n"
-        "/price — цена BTC"
+        "/price — цена BTC\n\n"
+        "Или используй кнопки меню внизу экрана.",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "ℹ️ Краткая справка:\n"
+        "- Отправь адрес контракта, чтобы получить инфо и кнопки отслеживания.\n"
+        "- Выбери, что отслеживать (цена, капа, объём) и задай порог в %.\n"
+        "- /watchlist покажет все активные токены.\n"
+        "- В алертах есть кнопки, чтобы отключить параметры или всё сразу."
     )
 
 
@@ -144,7 +165,9 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ) as resp:
                 data = await resp.json()
         btc_price = data["bitcoin"]["usd"]
-        await update.message.reply_text(f"₿ Bitcoin: ${btc_price:,}")
+        await update.message.reply_text(
+            f"₿ Bitcoin: ${btc_price:,}", reply_markup=main_menu_keyboard()
+        )
     except Exception as e:
         logger.error(f"Ошибка /price: {e}")
         await update.message.reply_text("❌ Ошибка получения цены BTC")
@@ -156,6 +179,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = (update.message.text or "").strip()
     logger.info(f"MSG от {user_id}: {text[:80]}")
+
+    # Обработка кнопок ReplyKeyboard
+    if text == "📋 Watchlist":
+        await watchlist(update, context)
+        return
+    if text == "❓ Помощь":
+        await help_cmd(update, context)
+        return
+    if text == "➕ Отслеживать токен":
+        await update.message.reply_text(
+            "Отправь адрес контракта токена, который хочешь отслеживать.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
 
     state = pending_threshold_input.get(user_id) or {
         "pending_volume_for": None,
@@ -169,19 +206,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             threshold = float(text.replace(",", "."))
         except ValueError:
-            await update.message.reply_text("❌ Не понял число. Введи %, например: 20")
+            await update.message.reply_text(
+                "❌ Не понял число. Введи %, например: 20",
+                reply_markup=main_menu_keyboard(),
+            )
             return
 
         info = tracked_tokens.get(address)
         if not info:
-            await update.message.reply_text("❌ Этот контракт уже не отслеживается.")
+            await update.message.reply_text(
+                "❌ Этот контракт уже не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
             pending_threshold_input.pop(user_id, None)
             return
 
         sub = ensure_subscriber(info, user_id)
 
         if threshold <= 0:
-            await update.message.reply_text("❌ Порог должен быть > 0.")
+            await update.message.reply_text(
+                "❌ Порог должен быть > 0.",
+                reply_markup=main_menu_keyboard(),
+            )
             return
 
         sub["vol_threshold"] = threshold
@@ -191,7 +237,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = format_addr_with_meta(address, info)
         await update.message.reply_text(
             f"✅ Порог объёма для {label}: {threshold:.1f}%.\n"
-            f"Бот будет слать сигнал при изменении m5 volume ≥ этого порога."
+            f"Бот будет слать сигнал при изменении m5 volume ≥ этого порога.",
+            reply_markup=main_menu_keyboard(),
         )
         return
 
@@ -201,19 +248,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             threshold = float(text.replace(",", "."))
         except ValueError:
-            await update.message.reply_text("❌ Не понял число. Введи %, например: 5")
+            await update.message.reply_text(
+                "❌ Не понял число. Введи %, например: 5",
+                reply_markup=main_menu_keyboard(),
+            )
             return
 
         info = tracked_tokens.get(address)
         if not info:
-            await update.message.reply_text("❌ Этот контракт уже не отслеживается.")
+            await update.message.reply_text(
+                "❌ Этот контракт уже не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
             pending_threshold_input.pop(user_id, None)
             return
 
         sub = ensure_subscriber(info, user_id)
 
         if threshold <= 0:
-            await update.message.reply_text("❌ Порог должен быть > 0.")
+            await update.message.reply_text(
+                "❌ Порог должен быть > 0.",
+                reply_markup=main_menu_keyboard(),
+            )
             return
 
         sub["price_threshold"] = threshold
@@ -223,7 +279,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = format_addr_with_meta(address, info)
         await update.message.reply_text(
             f"✅ Порог цены для {label}: {threshold:.1f}%.\n"
-            f"Приоритетный сигнал: изменение цены относительно предыдущего состояния."
+            f"Приоритетный сигнал: изменение цены относительно предыдущего состояния.",
+            reply_markup=main_menu_keyboard(),
         )
         return
 
@@ -233,19 +290,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             threshold = float(text.replace(",", "."))
         except ValueError:
-            await update.message.reply_text("❌ Не понял число. Введи %, например: 10")
+            await update.message.reply_text(
+                "❌ Не понял число. Введи %, например: 10",
+                reply_markup=main_menu_keyboard(),
+            )
             return
 
         info = tracked_tokens.get(address)
         if not info:
-            await update.message.reply_text("❌ Этот контракт уже не отслеживается.")
+            await update.message.reply_text(
+                "❌ Этот контракт уже не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
             pending_threshold_input.pop(user_id, None)
             return
 
         sub = ensure_subscriber(info, user_id)
 
         if threshold <= 0:
-            await update.message.reply_text("❌ Порог должен быть > 0.")
+            await update.message.reply_text(
+                "❌ Порог должен быть > 0.",
+                reply_markup=main_menu_keyboard(),
+            )
             return
 
         sub["mcap_threshold"] = threshold
@@ -255,13 +321,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = format_addr_with_meta(address, info)
         await update.message.reply_text(
             f"✅ Порог капитализации для {label}: {threshold:.1f}%.\n"
-            f"Приоритетный сигнал: изменение капитализации относительно предыдущего состояния."
+            f"Приоритетный сигнал: изменение капитализации относительно предыдущего состояния.",
+            reply_markup=main_menu_keyboard(),
         )
         return
 
     # Если это не ввод порога — считаем, что адрес контракта
     address = text
-    await update.message.reply_text(f"🔍 Анализирую {address[:12]}...")
+    await update.message.reply_text(
+        f"🔍 Анализирую {address[:12]}...", reply_markup=main_menu_keyboard()
+    )
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -269,11 +338,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pair = pick_best_pair(raw)
     except Exception as e:
         logger.error(f"Ошибка запроса токена {address}: {e}")
-        await update.message.reply_text("❌ Ошибка запроса токена.")
+        await update.message.reply_text(
+            "❌ Ошибка запроса токена.", reply_markup=main_menu_keyboard()
+        )
         return
 
     if not pair:
-        await update.message.reply_text("❌ Токен не найден. Проверь адрес!")
+        await update.message.reply_text(
+            "❌ Токен не найден. Проверь адрес!",
+            reply_markup=main_menu_keyboard(),
+        )
         return
 
     price_cur = float(pair.get("priceUsd", 0) or 0)
@@ -331,7 +405,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     )
 
-    await update.message.reply_text(text_resp, reply_markup=keyboard)
+    await update.message.reply_text(
+        text_resp, reply_markup=keyboard,
+    )
 
 
 # ------------ КНОПКИ ------------
@@ -364,7 +440,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label = format_addr_with_meta(address, info)
             await query.message.reply_text(
                 f"🛰 Введи порог изменения объёма m5 в % для {label}.\n"
-                f"Например: 20"
+                f"Например: 20",
+                reply_markup=main_menu_keyboard(),
             )
             return
 
@@ -381,7 +458,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label = format_addr_with_meta(address, info)
             await query.message.reply_text(
                 f"📈 Введи порог изменения цены в % для {label}.\n"
-                f"Например: 5"
+                f"Например: 5",
+                reply_markup=main_menu_keyboard(),
             )
             return
 
@@ -398,40 +476,60 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label = format_addr_with_meta(address, info)
             await query.message.reply_text(
                 f"🏦 Введи порог изменения капитализации в % для {label}.\n"
-                f"Например: 10"
+                f"Например: 10",
+                reply_markup=main_menu_keyboard(),
             )
             return
 
     # Отключение из алерта
     if data.startswith("disable_"):
-        _, kind, address = data.split(":", 2)
+        prefix, address = data.split(":", 1)
+        kind = prefix.replace("disable_", "")
         info = tracked_tokens.get(address)
         if not info:
-            await query.message.reply_text("⚠️ Этот токен уже не отслеживается.")
+            await query.message.reply_text(
+                "⚠️ Этот токен уже не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
             return
 
         subs = info.get("subscribers", {})
         sub = subs.get(user_id)
         if not sub:
-            await query.message.reply_text("⚠️ Подписка для этого токена уже снята.")
+            await query.message.reply_text(
+                "⚠️ Подписка для этого токена уже снята.",
+                reply_markup=main_menu_keyboard(),
+            )
             return
 
         label = format_addr_with_meta(address, info)
 
         if kind == "price":
             sub["price_threshold"] = None
-            await query.message.reply_text(f"✅ Отключены алерты цены для {label}.")
+            await query.message.reply_text(
+                f"✅ Отключены алерты цены для {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
         elif kind == "mcap":
             sub["mcap_threshold"] = None
-            await query.message.reply_text(f"✅ Отключены алерты капы для {label}.")
+            await query.message.reply_text(
+                f"✅ Отключены алерты капы для {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
         elif kind == "vol":
             sub["vol_threshold"] = None
-            await query.message.reply_text(f"✅ Отключены алерты объёма для {label}.")
+            await query.message.reply_text(
+                f"✅ Отключены алерты объёма для {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
         elif kind == "all":
             subs.pop(user_id, None)
-            await query.message.reply_text(f"🛑 Полностью отключено отслеживание {label}.")
             if not subs:
                 tracked_tokens.pop(address, None)
+            await query.message.reply_text(
+                f"🛑 Полностью отключено отслеживание {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
 
         return
 
@@ -456,27 +554,36 @@ async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if vt is not None:
             parts.append(f"vol ≥ {vt:.1f}%")
         if not parts:
-            continue
+            parts.append("параметры отключены")
         label = format_addr_with_meta(address, info)
         rows.append(f"{label} ({', '.join(parts)})")
 
     if not rows:
-        await update.message.reply_text("👀 Сейчас ты ничего не отслеживаешь.")
+        await update.message.reply_text(
+            "👀 Сейчас ты ничего не отслеживаешь.",
+            reply_markup=main_menu_keyboard(),
+        )
         return
 
     text = "🛰 Ты отслеживаешь:\n" + "\n".join(f"- {row}" for row in rows)
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, reply_markup=main_menu_keyboard())
 
 
 async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not context.args:
-        await update.message.reply_text("Используй: /unwatch <адрес_контракта>")
+        await update.message.reply_text(
+            "Используй: /unwatch <адрес_контракта>",
+            reply_markup=main_menu_keyboard(),
+        )
         return
     address = context.args[0].strip()
     info = tracked_tokens.get(address)
     if not info or user_id not in info.get("subscribers", {}):
-        await update.message.reply_text("❌ Этот адрес ты сейчас не отслеживаешь.")
+        await update.message.reply_text(
+            "❌ Этот адрес ты сейчас не отслеживаешь.",
+            reply_markup=main_menu_keyboard(),
+        )
         return
     info["subscribers"].pop(user_id, None)
     if not info["subscribers"]:
@@ -491,7 +598,10 @@ async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state["pending_mcap_for"] = None
         pending_threshold_input[user_id] = state
     label = format_addr_with_meta(address, info or {})
-    await update.message.reply_text(f"✅ Отключил отслеживание для {label}.")
+    await update.message.reply_text(
+        f"✅ Отключил отслеживание для {label}.",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 # ------------ ФОНОВЫЙ МОНИТОР ------------
@@ -594,83 +704,3 @@ async def market_watcher(app: Application):
                         )
 
                         keyboard = InlineKeyboardMarkup(
-                            [
-                                [
-                                    InlineKeyboardButton(
-                                        "❌ Цена",
-                                        callback_data=f"disable_price:{address}",
-                                    ),
-                                    InlineKeyboardButton(
-                                        "❌ Капа",
-                                        callback_data=f"disable_mcap:{address}",
-                                    ),
-                                ],
-                                [
-                                    InlineKeyboardButton(
-                                        "❌ Объём",
-                                        callback_data=f"disable_vol:{address}",
-                                    ),
-                                    InlineKeyboardButton(
-                                        "🛑 Всё",
-                                        callback_data=f"disable_all:{address}",
-                                    ),
-                                ],
-                            ]
-                        )
-
-                        try:
-                            await app.bot.send_message(
-                                chat_id=uid,
-                                text=msg,
-                                reply_markup=keyboard,
-                                parse_mode="Markdown",
-                            )
-                            logger.info(f"Алёрт отправлен {uid} для {address[:8]}")
-                        except Exception as e:
-                            logger.error(f"Ошибка отправки алерта {uid}: {e}")
-
-                        # обновляем базовое состояние после алерта
-                        cfg["last_price"] = price_cur
-                        cfg["last_volume_m5"] = vol_m5_cur
-                        cfg["last_mcap"] = mcap_cur
-                        cfg["last_ts"] = time.time()
-
-            await asyncio.sleep(5)
-
-        except Exception as e:
-            logger.error(f"Критическая ошибка market_watcher: {e}")
-            await asyncio.sleep(10)
-
-
-async def post_init(app: Application):
-    logger.info("post_init: запускаем market_watcher в фоне")
-    asyncio.create_task(market_watcher(app))
-
-
-# ------------ MAIN ------------
-
-def main():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN не найден. Проверь переменную окружения.")
-        raise SystemExit("BOT_TOKEN is missing")
-
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("price", price))
-    app.add_handler(CommandHandler("watchlist", watchlist))
-    app.add_handler(CommandHandler("unwatch", unwatch))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(button_callback))
-
-    logger.info("Бот запущен, начинаем polling…")
-    app.run_polling(drop_pending_updates=True)
-
-
-if __name__ == "__main__":
-    main()

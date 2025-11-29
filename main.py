@@ -37,6 +37,7 @@ ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
 BASESCAN_API_KEY = os.getenv("BASESCAN_API_KEY", "")
 BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+MORALIS_API_KEY = os.getenv("MORALIS_API_KEY", "")
 
 # ============ НАСТРОЙКИ ============
 

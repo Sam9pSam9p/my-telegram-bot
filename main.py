@@ -474,37 +474,39 @@ async def show_portfolio_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def view_portfolio_full(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Просмотр полного портфеля"""
     user_id = update.effective_user.id
+    message = update.effective_message
     user_data = get_user_wallets(user_id)
     wallets = user_data.get("wallets", {})
-    
+
     if not wallets:
-        await update.message.reply_text(
+        await message.reply_text(
             "💼 Твой портфель пуст!\n\n➕ Добавь кошелек, чтобы начать отслеживание.",
-            reply_markup=main_menu_keyboard()
+            reply_markup=main_menu_keyboard(),
         )
         return
-    
-    text = "💼 **ТВой ПОРТФЕЛЬ:**\n\n"
+
+    text = "💼 **Твой ПОРТФЕЛЬ:**\n\n"
     total_usd = 0
-    
+
     for wallet_id, wallet_info in wallets.items():
         addr = wallet_info.get("address", "")
         chain = wallet_info.get("chain", "")
         name = wallet_info.get("name", chain)
         balance = wallet_info.get("balance", 0)
         usd = wallet_info.get("usd_value", 0)
-        
+
         total_usd += usd
         emoji = {"solana": "🟣", "ethereum": "⚪", "base": "🔵", "bsc": "🟡"}.get(chain, "💫")
-        
+
         text += f"{emoji} **{name}** ({chain.upper()})\n"
         text += f"   💰 {balance:.4f} | ${usd:,.2f}\n"
         text += f"   {short_addr(addr)}\n\n"
-    
+
     text += f"**━━━━━━━━━━━━━━━━━━━━**\n"
     text += f"**ИТОГО: ${total_usd:,.2f}**"
-    
-    await update.message.reply_text(text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
+
+    await message.reply_text(text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
+
 
 
 # ============ ОБРАБОТКА СООБЩЕНИЙ ============

@@ -445,25 +445,30 @@ async def show_portfolio_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = update.effective_user.id
     user_data = get_user_wallets(user_id)
     wallets = user_data.get("wallets", {})
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Добавить кошелек", callback_data="portfolio:add")],
-        [InlineKeyboardButton("👁️ Просмотреть портфель", callback_data="portfolio:view")],
-        [InlineKeyboardButton("🔄 Обновить баланс", callback_data="portfolio:refresh")],
-    ])
-    
-   if wallets:
+
     keyboard = InlineKeyboardMarkup(
-        list(keyboard.inline_keyboard)
-        + [[InlineKeyboardButton("🗑 Удалить кошелек", callback_data="portfolio:delete")]]
+        [
+            [InlineKeyboardButton("➕ Добавить кошелек", callback_data="portfolio:add")],
+            [InlineKeyboardButton("👁️ Просмотреть портфель", callback_data="portfolio:view")],
+            [InlineKeyboardButton("🔄 Обновить баланс", callback_data="portfolio:refresh")],
+        ]
     )
 
-    
-        
+    if wallets:
+        keyboard = InlineKeyboardMarkup(
+            list(keyboard.inline_keyboard)
+            + [[InlineKeyboardButton("🗑 Удалить кошелек", callback_data="portfolio:delete")]]
+        )
+
     count = len(wallets)
-    text = f"💼 **МОЙ ПОРТФЕЛЬ**\n\n📊 Кошельков добавлено: **{count}**\n\nЧто хочешь сделать?"
-    
+    text = (
+        f"💼 **МОЙ ПОРТФЕЛЬ**\n\n"
+        f"📥 Кошельков добавлено: **{count}**\n\n"
+        f"Что хочешь сделать?"
+    )
+
     await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
 
 
 async def view_portfolio_full(update: Update, context: ContextTypes.DEFAULT_TYPE):

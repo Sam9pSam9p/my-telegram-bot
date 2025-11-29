@@ -122,12 +122,12 @@ async def get_solana_balance(address: str) -> dict:
         return {"balance": 0, "usd_value": 0, "price": 0}
 async def get_evm_portfolio_moralis(address: str, chain: str = "ethereum") -> dict:
     """
-    Получает полный EVM-портфель через Moralis Wallet API:
+    Получает EVM-портфель через Moralis Wallet API:
     native + токены, итоговую сумму в USD.
     """
     if not MORALIS_API_KEY:
         logger.warning("⚠️ MORALIS_API_KEY is missing")
-        return {"native": 0, "tokens": [], "total_usd": 0}
+        return {"balance": 0, "usd_value": 0, "tokens": []}
 
     chain_map = {
         "ethereum": "eth",
@@ -137,9 +137,10 @@ async def get_evm_portfolio_moralis(address: str, chain: str = "ethereum") -> di
     moralis_chain = chain_map.get(chain)
     if not moralis_chain:
         logger.warning(f"⚠️ Moralis: unsupported chain={chain}")
-        return {"native": 0, "tokens": [], "total_usd": 0}
+        return {"balance": 0, "usd_value": 0, "tokens": []}
 
-    url = f"https://deep-index.moralis.io/api/v2.2/wallets/{address}/portfolio"
+    # Используем метод getWalletTokenBalancesPrices
+    url = f"https://deep-index.moralis.io/api/v2.2/wallets/{address}/tokens"
 
     params = {
         "chain": moralis_chain,
@@ -157,20 +158,30 @@ async def get_evm_portfolio_moralis(address: str, chain: str = "ethereum") -> di
                 data = await resp.json()
     except Exception as e:
         logger.error(f"⚠️ Moralis error for {chain} {address}: {e}")
-        return {"native": 0, "tokens": [], "total_usd": 0}
+        return {"balance": 0, "usd_value": 0, "tokens": []}
 
-    native_balance = float(data.get("native", {}).get("balance", 0) or 0)
-    total_usd = float(data.get("stats", {}).get("total_portfolio_usd", 0) or 0)
     tokens = []
+    total_usd = 0.0
+    native_balance = 0.0
 
-    for t in data.get("tokens", []):
+    for t in data or []:
         try:
+            symbol = t.get("symbol") or ""
+            name = t.get("name") or ""
+            balance = float(t.get("balance_formatted") or t.get("balance", 0) or 0)
+            usd_value = float(t.get("usd_value", 0) or 0)
+
+            total_usd += usd_value
+
+            if t.get("is_native"):
+                native_balance = balance
+
             tokens.append(
                 {
-                    "symbol": t.get("symbol") or "",
-                    "name": t.get("name") or "",
-                    "balance": float(t.get("balance", 0) or 0),
-                    "usd_value": float(t.get("usd_value", 0) or 0),
+                    "symbol": symbol,
+                    "name": name,
+                    "balance": balance,
+                    "usd_value": usd_value,
                 }
             )
         except Exception:
@@ -181,11 +192,13 @@ async def get_evm_portfolio_moralis(address: str, chain: str = "ethereum") -> di
         f"native={native_balance} total_usd={total_usd}"
     )
 
+    # Формат под update_wallet_balance
     return {
-        "native": native_balance,
+        "balance": round(native_balance, 6),
+        "usd_value": round(total_usd, 2),
         "tokens": tokens,
-        "total_usd": total_usd,
     }
+
 
 async def get_evm_balance(address: str, chain: str = "ethereum") -> dict:
     """Получает баланс нативной монеты через Etherscan V2 мультичейн."""

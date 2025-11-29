@@ -120,6 +120,72 @@ async def get_solana_balance(address: str) -> dict:
     except Exception as e:
         logger.error(f"❌ Ошибка Solana баланса: {e}")
         return {"balance": 0, "usd_value": 0, "price": 0}
+async def get_evm_portfolio_moralis(address: str, chain: str = "ethereum") -> dict:
+    """
+    Получает полный EVM-портфель через Moralis Wallet API:
+    native + токены, итоговую сумму в USD.
+    """
+    if not MORALIS_API_KEY:
+        logger.warning("⚠️ MORALIS_API_KEY is missing")
+        return {"native": 0, "tokens": [], "total_usd": 0}
+
+    chain_map = {
+        "ethereum": "eth",
+        "base": "base",
+        "bsc": "bsc",
+    }
+    moralis_chain = chain_map.get(chain)
+    if not moralis_chain:
+        logger.warning(f"⚠️ Moralis: unsupported chain={chain}")
+        return {"native": 0, "tokens": [], "total_usd": 0}
+
+    url = f"https://deep-index.moralis.io/api/v2.2/wallets/{address}/portfolio"
+
+    params = {
+        "chain": moralis_chain,
+        "exclude_spam": "true",
+    }
+
+    headers = {
+        "X-API-Key": MORALIS_API_KEY,
+        "accept": "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(20)) as session:
+            async with session.get(url, params=params, headers=headers) as resp:
+                data = await resp.json()
+    except Exception as e:
+        logger.error(f"⚠️ Moralis error for {chain} {address}: {e}")
+        return {"native": 0, "tokens": [], "total_usd": 0}
+
+    native_balance = float(data.get("native", {}).get("balance", 0) or 0)
+    total_usd = float(data.get("stats", {}).get("total_portfolio_usd", 0) or 0)
+    tokens = []
+
+    for t in data.get("tokens", []):
+        try:
+            tokens.append(
+                {
+                    "symbol": t.get("symbol") or "",
+                    "name": t.get("name") or "",
+                    "balance": float(t.get("balance", 0) or 0),
+                    "usd_value": float(t.get("usd_value", 0) or 0),
+                }
+            )
+        except Exception:
+            continue
+
+    logger.info(
+        f"Moralis portfolio chain={chain} addr={short_addr(address)} "
+        f"native={native_balance} total_usd={total_usd}"
+    )
+
+    return {
+        "native": native_balance,
+        "tokens": tokens,
+        "total_usd": total_usd,
+    }
 
 async def get_evm_balance(address: str, chain: str = "ethereum") -> dict:
     """Получает баланс нативной монеты через Etherscan V2 мультичейн."""
@@ -1264,7 +1330,7 @@ async def update_wallet_balance(user_id: int, wallet_id: str):
     if chain == "solana":
         balance_data = await get_solana_balance(address)
     else:
-        balance_data = await get_evm_balance(address, chain)
+        balance_data = await get_evm_portfolio_moralis(address, chain)
     
     wallet["balance"] = balance_data.get("balance", 0)
     wallet["usd_value"] = balance_data.get("usd_value", 0)

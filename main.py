@@ -455,8 +455,7 @@ async def show_portfolio_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     if wallets:
         keyboard.inline_keyboard.append([InlineKeyboardButton("🗑️ Удалить кошелек", callback_data="portfolio:delete")])
     
-    keyboard.inline_keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="portfolio:back")])
-    
+        
     count = len(wallets)
     text = f"💼 **МОЙ ПОРТФЕЛЬ**\n\n📊 Кошельков добавлено: **{count}**\n\nЧто хочешь сделать?"
     

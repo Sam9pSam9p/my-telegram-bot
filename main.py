@@ -121,62 +121,84 @@ async def get_solana_balance(address: str) -> dict:
         return {"balance": 0, "usd_value": 0, "price": 0}
 
 async def get_evm_balance(address: str, chain: str = "ethereum") -> dict:
-    """Получает баланс кошелька Ethereum/Base/BSC"""
+    """Получает баланс нативной монеты через Etherscan V2 мультичейн."""
     try:
-        if chain == "ethereum":
-            api_key = ETHERSCAN_API_KEY
-            url = "https://api.etherscan.io/api"
-            symbol = "ETH"
-            coin_id = "ethereum"
-        elif chain == "base":
-            api_key = BASESCAN_API_KEY
-            url = "https://api.basescan.org/api"
-            symbol = "ETH"
-            coin_id = "ethereum"
-        elif chain == "bsc":
-            api_key = BSCSCAN_API_KEY
-            url = "https://api.bscscan.com/api"
-            symbol = "BNB"
-            coin_id = "binancecoin"
-        else:
-            return {"balance": 0, "usd_value": 0, "price": 0}
-        
+        api_key = ETHERSCAN_API_KEY
         if not api_key:
-            logger.warning(f"⚠️ API ключ для {chain} не найден")
+            logger.warning(f"⚠️ EVM V2: API key missing for chain={chain}")
             return {"balance": 0, "usd_value": 0, "price": 0}
-        
+
+        # соответствие chain -> chainid для V2
+        chain_ids = {
+            "ethereum": 1,   # Ethereum mainnet
+            "base": 8453,    # Base mainnet
+            "bsc": 56,       # BNB Smart Chain (если поддерживается планом)
+        }
+        coin_ids = {
+            "ethereum": ("ethereum", "ETH"),
+            "base": ("ethereum", "ETH"),
+            "bsc": ("binancecoin", "BNB"),
+        }
+
+        chainid = chain_ids.get(chain)
+        if not chainid:
+            logger.warning(f"⚠️ EVM V2: unsupported chain={chain}")
+            return {"balance": 0, "usd_value": 0, "price": 0}
+
+        coin_id, symbol = coin_ids.get(chain, ("ethereum", "ETH"))
+
+        base_url = "https://api.etherscan.io/v2/api"
+
         params = {
+            "chainid": chainid,
             "module": "account",
             "action": "balance",
             "address": address,
-            "apikey": api_key
+            "tag": "latest",
+            "apikey": api_key,
         }
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(5)) as resp:
-                data = await resp.json()
-                
-                if data.get("status") != "1":
-                    logger.warning(f"⚠️ {chain} API: {data.get('message', 'Unknown error')}")
-                    return {"balance": 0, "usd_value": 0, "price": 0}
-                
-                balance_wei = int(data.get("result", "0") or 0)
-                balance_coin = balance_wei / 1e18
-                
-                # Получаем цену
-                async with session.get(f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd") as price_resp:
-                    price_data = await price_resp.json()
-                    coin_price = price_data.get(coin_id, {}).get("usd", 0)
-                
-                return {
-                    "balance": round(balance_coin, 4),
-                    "usd_value": round(balance_coin * coin_price, 2),
-                    "price": coin_price
-                }
-    except Exception as e:
-        logger.error(f"❌ Ошибка {chain} баланса: {e}")
-        return {"balance": 0, "usd_value": 0, "price": 0}
 
+        logger.info(f"EVM V2 request: chain={chain}, url={base_url}, params={params}")
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(15)) as session:
+            async with session.get(base_url, params=params) as resp:
+                data = await resp.json()
+
+            status = str(data.get("status"))
+            message = data.get("message")
+            result = data.get("result")
+
+            logger.info(
+                f"EVM V2 response: chain={chain}, status={status}, message={message}, "
+                f"result_preview={str(result)[:80]}"
+            )
+
+            if status != "1" or message != "OK":
+                logger.warning(
+                    f"⚠️ EVM V2: API error for chain={chain}, addr={address}: "
+                    f"status={status}, message={message}, result={result}"
+                )
+                return {"balance": 0, "usd_value": 0, "price": 0}
+
+            balance_wei = int(result)
+            balance = balance_wei / 1e18
+
+            # получаем цену с Coingecko
+            async with session.get(
+                f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+            ) as price_resp:
+                price_data = await price_resp.json()
+                coin_price = price_data.get(coin_id, {}).get("usd", 0)
+
+        return {
+            "balance": round(balance, 4),
+            "usd_value": round(balance * coin_price, 2),
+            "price": coin_price,
+        }
+
+    except Exception as e:
+        logger.error(f"⚠️ EVM V2 balance error for {chain}: {e}")
+        return {"balance": 0, "usd_value": 0, "price": 0}
 
 # ============ УТИЛИТЫ ============
 

@@ -7,6 +7,8 @@ import re
 from collections import deque
 from dotenv import load_dotenv
 from typing import Dict, List, Optional
+from telegram import Update
+from telegram.ext import CommandHandler, ContextTypes
 
 import aiohttp
 from telegram import (
@@ -660,6 +662,23 @@ async def post_init(app: Application):
     # Данные уже загружены при инициализации
     asyncio.create_task(market_watcher(app))
 
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /help"""
+    help_text = """
+🤖 **Доступные команды:**
+
+/start - Запустить бота
+/help - Показать справку
+/wallet - Управление кошельками
+/token - Управление токенами
+/balance - Проверить баланс
+
+📊 **Основные функции:**
+- Отслеживание балансов
+- Уведомления о транзакциях
+- Управление несколькими кошельками
+    """
+    await update.message.reply_text(help_text, parse_mode='Markdown')
 def main():
     """Основная функция запуска"""
     if not BOT_TOKEN:

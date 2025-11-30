@@ -3,12 +3,8 @@ import time
 import logging
 import asyncio
 import json
-import re
 from collections import deque
 from dotenv import load_dotenv
-from typing import Dict, List, Optional
-from telegram import Update
-from telegram.ext import CommandHandler, ContextTypes
 
 import aiohttp
 from telegram import (
@@ -32,7 +28,7 @@ from dexscreener_service import (
     pick_best_pair,
 )
 
-# ============ КОНСТАНТЫ И НАСТРОЙКИ ============
+# ============ ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ============
 
 load_dotenv()
 
@@ -43,14 +39,7 @@ BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
 MORALIS_API_KEY = os.getenv("MORALIS_API_KEY", "")
 
-# Лимиты системы
-MAX_TOKENS_PER_USER = 50
-MAX_WALLETS_PER_USER = 10
-API_RATE_LIMIT_DELAY = 1  # секунды между запросами
-
-# Файлы данных
-WALLETS_DATA_FILE = "bot_wallets.json"
-TOKENS_DATA_FILE = "bot_tokens.json"
+# ============ НАСТРОЙКИ ============
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -58,229 +47,614 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ============ МЕНЕДЖЕРЫ ДАННЫХ ============
+# Глобальные переменные WATCHLIST
+tracked_tokens: dict[str, dict] = {}
+pending_threshold_input: dict[int, dict] = {}
 
-class DataManager:
-    """Управление сохранением и загрузкой данных"""
-    
-    @staticmethod
-    def load_wallets() -> Dict[int, dict]:
-        """Загружает данные кошельков"""
+# Глобальные переменные ПОРТФЕЛЯ
+user_wallets: dict[int, dict] = {}
+pending_wallet_input: dict[int, dict] = {}
+DATA_FILE = "bot_data.json"
+
+PORTFOLIO_UPDATE_INTERVAL = 600  # 10 минут
+PORTFOLIO_LAST_UPDATE = {}
+
+
+# ============ ФУНКЦИИ JSON ХРАНИЛИЩА ============
+
+def load_data():
+    """Загружает данные из bot_data.json"""
+    global user_wallets
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            user_wallets = {int(k): v for k, v in data.items()}
+            logger.info(f"📊 Данные загружены: {len(user_wallets)} пользователей")
+    except FileNotFoundError:
+        user_wallets = {}
+        logger.info("📊 Новое хранилище создано")
+
+def save_data():
+    """Сохраняет данные в bot_data.json"""
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(user_wallets, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения: {e}")
+
+def get_user_wallets(user_id: int) -> dict:
+    """Получает кошельки пользователя"""
+    if user_id not in user_wallets:
+        user_wallets[user_id] = {"wallets": {}, "last_update": 0}
+        save_data()
+    return user_wallets[user_id]
+
+
+# ============ ФУНКЦИИ ПОЛУЧЕНИЯ БАЛАНСА ============
+
+async def get_solana_balance(address: str) -> dict:
+    """Получает баланс кошелька Solana"""
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBalance",
+            "params": [address]
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(SOLANA_RPC, json=payload, timeout=aiohttp.ClientTimeout(5)) as resp:
+                data = await resp.json()
+                balance_lamports = data.get("result", {}).get("value", 0)
+                balance_sol = balance_lamports / 1e9
+                
+                # Получаем цену SOL
+                async with session.get("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd") as price_resp:
+                    price_data = await price_resp.json()
+                    sol_price = price_data.get("solana", {}).get("usd", 0)
+                
+                return {
+                    "balance": round(balance_sol, 4),
+                    "usd_value": round(balance_sol * sol_price, 2),
+                    "price": sol_price
+                }
+    except Exception as e:
+        logger.error(f"❌ Ошибка Solana баланса: {e}")
+        return {"balance": 0, "usd_value": 0, "price": 0}
+async def get_evm_portfolio_moralis(address: str, chain: str = "ethereum") -> dict:
+    """
+    Получает EVM-портфель через Moralis Wallet API:
+    native + токены, итоговую сумму в USD.
+    """
+    if not MORALIS_API_KEY:
+        logger.warning("⚠️ MORALIS_API_KEY is missing")
+        return {"balance": 0, "usd_value": 0, "tokens": []}
+
+    chain_map = {
+        "ethereum": "eth",
+        "base": "base",
+        "bsc": "bsc",
+    }
+    moralis_chain = chain_map.get(chain)
+    if not moralis_chain:
+        logger.warning(f"⚠️ Moralis: unsupported chain={chain}")
+        return {"balance": 0, "usd_value": 0, "tokens": []}
+
+    # Используем метод getWalletTokenBalancesPrices
+    url = f"https://deep-index.moralis.io/api/v2.2/wallets/{address}/tokens"
+
+    params = {
+        "chain": moralis_chain,
+        "exclude_spam": "true",
+    }
+
+    headers = {
+        "X-API-Key": MORALIS_API_KEY,
+        "accept": "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(20)) as session:
+            async with session.get(url, params=params, headers=headers) as resp:
+                data = await resp.json()
+    except Exception as e:
+        logger.error(f"⚠️ Moralis error for {chain} {address}: {e}")
+        return {"balance": 0, "usd_value": 0, "tokens": []}
+
+    tokens = []
+    total_usd = 0.0
+    native_balance = 0.0
+
+    for t in data or []:
         try:
-            with open(WALLETS_DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                logger.info(f"📊 Кошельки загружены: {len(data)} пользователей")
-                return {int(k): v for k, v in data.items()}
-        except FileNotFoundError:
-            logger.info("📊 Новое хранилище кошельков создано")
-            return {}
+            symbol = t.get("symbol") or ""
+            name = t.get("name") or ""
+            balance = float(t.get("balance_formatted") or t.get("balance", 0) or 0)
+            usd_value = float(t.get("usd_value", 0) or 0)
 
-    @staticmethod
-    def save_wallets(data: Dict[int, dict]):
-        """Сохраняет данные кошельков"""
-        try:
-            with open(WALLETS_DATA_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"❌ Ошибка сохранения кошельков: {e}")
+            total_usd += usd_value
 
-    @staticmethod
-    def load_tokens() -> Dict[str, dict]:
-        """Загружает данные отслеживаемых токенов"""
-        try:
-            with open(TOKENS_DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                logger.info(f"📊 Токены загружены: {len(data)} записей")
-                return data
-        except FileNotFoundError:
-            logger.info("📊 Новое хранилище токенов создано")
-            return {}
+            if t.get("is_native"):
+                native_balance = balance
 
-    @staticmethod
-    def save_tokens(data: Dict[str, dict]):
-        """Сохраняет данные токенов"""
-        try:
-            with open(TOKENS_DATA_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"❌ Ошибка сохранения токенов: {e}")
+            tokens.append(
+                {
+                    "symbol": symbol,
+                    "name": name,
+                    "balance": balance,
+                    "usd_value": usd_value,
+                }
+            )
+        except Exception:
+            continue
 
-# ============ ВАЛИДАТОРЫ ============
+    logger.info(
+        f"Moralis portfolio chain={chain} addr={short_addr(address)} "
+        f"native={native_balance} total_usd={total_usd}"
+    )
 
-class AddressValidator:
-    """Валидация блокчейн-адресов"""
+    # Формат под update_wallet_balance
+    return {
+        "balance": round(native_balance, 6),
+        "usd_value": round(total_usd, 2),
+        "tokens": tokens,
+    }
+
+
+async def get_evm_balance(address: str, chain: str = "ethereum") -> dict:
+    """Получает баланс нативной монеты через Etherscan V2 мультичейн."""
+    try:
+        api_key = ETHERSCAN_API_KEY
+        if not api_key:
+            logger.warning(f"⚠️ EVM V2: API key missing for chain={chain}")
+            return {"balance": 0, "usd_value": 0, "price": 0}
+
+        # соответствие chain -> chainid для V2
+        chain_ids = {
+            "ethereum": 1,   # Ethereum mainnet
+            "base": 8453,    # Base mainnet
+            "bsc": 56,       # BNB Smart Chain (если поддерживается планом)
+        }
+        coin_ids = {
+            "ethereum": ("ethereum", "ETH"),
+            "base": ("ethereum", "ETH"),
+            "bsc": ("binancecoin", "BNB"),
+        }
+
+        chainid = chain_ids.get(chain)
+        if not chainid:
+            logger.warning(f"⚠️ EVM V2: unsupported chain={chain}")
+            return {"balance": 0, "usd_value": 0, "price": 0}
+
+        coin_id, symbol = coin_ids.get(chain, ("ethereum", "ETH"))
+
+        base_url = "https://api.etherscan.io/v2/api"
+
+        params = {
+            "chainid": chainid,
+            "module": "account",
+            "action": "balance",
+            "address": address,
+            "tag": "latest",
+            "apikey": api_key,
+        }
+
+        logger.info(f"EVM V2 request: chain={chain}, url={base_url}, params={params}")
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(15)) as session:
+            async with session.get(base_url, params=params) as resp:
+                data = await resp.json()
+
+            status = str(data.get("status"))
+            message = data.get("message")
+            result = data.get("result")
+
+            logger.info(
+                f"EVM V2 response: chain={chain}, status={status}, message={message}, "
+                f"result_preview={str(result)[:80]}"
+            )
+
+            if status != "1" or message != "OK":
+                logger.warning(
+                    f"⚠️ EVM V2: API error for chain={chain}, addr={address}: "
+                    f"status={status}, message={message}, result={result}"
+                )
+                return {"balance": 0, "usd_value": 0, "price": 0}
+
+            balance_wei = int(result)
+            balance = balance_wei / 1e18
+
+            # получаем цену с Coingecko
+            async with session.get(
+                f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+            ) as price_resp:
+                price_data = await price_resp.json()
+                coin_price = price_data.get(coin_id, {}).get("usd", 0)
+
+        return {
+            "balance": round(balance, 4),
+            "usd_value": round(balance * coin_price, 2),
+            "price": coin_price,
+        }
+
+    except Exception as e:
+        logger.error(f"⚠️ EVM V2 balance error for {chain}: {e}")
+        return {"balance": 0, "usd_value": 0, "price": 0}
+
+# ============ УТИЛИТЫ ============
+
+def map_chain(chain_id: str | None) -> str:
+    if not chain_id:
+        return "Unknown"
+    mapping = {
+        "solana": "Solana",
+        "eth": "Ethereum",
+        "ethereum": "Ethereum",
+        "bsc": "BSC",
+        "bnb": "BSC",
+        "base": "Base",
+        "polygon": "Polygon",
+        "arbitrum": "Arbitrum",
+        "optimism": "Optimism",
+        "avax": "Avalanche",
+    }
+    return mapping.get(chain_id.lower(), chain_id)
+
+
+def format_addr_with_meta(address: str, info: dict | None) -> str:
+    symbol = info.get("symbol") if info else None
+    chain = map_chain(info.get("chain")) if info else "Unknown"
+    base = address
+    meta = []
+
+    if symbol:
+        meta.append(symbol)
+    if chain:
+        meta.append(chain)
+
+    if not meta:
+        return base
+
+    return f"{base} ({', '.join(meta)})"
+
+
+def short_addr(address: str) -> str:
+    """Сокращает адрес: первые 4 + ... + последние 4 символа"""
+    if len(address) <= 10:
+        return address
+    return f"{address[:4]}...{address[-4:]}"
+
+
+def pct_change(new: float | None, old: float | None) -> float | None:
+    if new is None or old is None or old == 0:
+        return None
+    return (new - old) / old * 100.0
+
+
+def ensure_subscriber(info: dict, user_id: int) -> dict:
+    subs = info.setdefault("subscribers", {})
+    sub = subs.get(user_id)
+
+    if not sub:
+        sub = {
+            "vol_threshold": None,
+            "price_threshold": None,
+            "mcap_threshold": None,
+            "last_price": None,
+            "last_volume_m5": None,
+            "last_mcap": None,
+            "last_ts": None,
+            "last_alert_ts": None,
+            "volume_history": deque(maxlen=200),
+        }
+        subs[user_id] = sub
+
+    return sub
+
+
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    """Главное меню с кнопками"""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("➕ Добавить токен"), KeyboardButton("📋 Watchlist")],
+            [KeyboardButton("💼 Мой портфель"), KeyboardButton("📊 Статистика")],
+            [KeyboardButton("🔗 Инструменты"), KeyboardButton("⚙️ Настройки")],
+            [KeyboardButton("❓ Справка")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+def detect_pump_dump(history: deque) -> str:
+    """Анализирует памп/дамп"""
+    if len(history) < 3:
+        return ""
+
+    recent = list(history)[-5:]
+    buy_vols = [b for _, b, _ in recent]
+    sell_vols = [s for _, _, s in recent]
+
+    avg_buy = sum(buy_vols) / len(buy_vols) if buy_vols else 0
+    avg_sell = sum(sell_vols) / len(sell_vols) if sell_vols else 0
+
+    if buy_vols and buy_vols[-1] > avg_buy * 2.5:
+        return "📈 Возможный памп (высокий buy объём)"
     
-    @staticmethod
-    def validate_evm_address(address: str) -> bool:
-        """Проверяет валидность EVM адреса"""
-        pattern = r'^0x[a-fA-F0-9]{40}$'
-        return bool(re.match(pattern, address))
+    if sell_vols and sell_vols[-1] > avg_sell * 2.5:
+        return "📉 Возможный дамп (высокий sell объём)"
     
-    @staticmethod
-    def validate_solana_address(address: str) -> bool:
-        """Проверяет валидность Solana адреса"""
-        pattern = r'^[1-9A-HJ-NP-Za-km-z]{32,44}$'
-        return bool(re.match(pattern, address))
-    
-    @staticmethod
-    def validate_address(address: str, chain: str = "auto") -> bool:
-        """Универсальная валидация адреса"""
-        if chain == "solana" or (chain == "auto" and not address.startswith("0x")):
-            return AddressValidator.validate_solana_address(address)
-        else:
-            return AddressValidator.validate_evm_address(address)
+    return ""
 
-class RateLimiter:
-    """Система ограничения запросов"""
-    
-    def __init__(self):
-        self.user_requests: Dict[int, List[float]] = {}
-        self.global_requests: List[float] = []
-    
-    async def check_user_limit(self, user_id: int, max_requests: int = 10, window: int = 60) -> bool:
-        """Проверяет лимит запросов пользователя"""
-        now = time.time()
-        if user_id not in self.user_requests:
-            self.user_requests[user_id] = []
-        
-        # Удаляем старые запросы
-        self.user_requests[user_id] = [
-            req_time for req_time in self.user_requests[user_id] 
-            if now - req_time < window
-        ]
-        
-        if len(self.user_requests[user_id]) >= max_requests:
-            return False
-        
-        self.user_requests[user_id].append(now)
-        return True
-    
-    async def wait_if_needed(self):
-        """Ждет если нужно соблюсти глобальный rate limit"""
-        now = time.time()
-        self.global_requests = [
-            req_time for req_time in self.global_requests 
-            if now - req_time < 60
-        ]
-        
-        if len(self.global_requests) >= 30:  # 30 запросов в минуту
-            await asyncio.sleep(1)
-        
-        self.global_requests.append(now)
 
-# ============ GLOBALS ============
+# ============ КОМАНДЫ ============
 
-# Инициализация менеджеров данных
-user_wallets = DataManager.load_wallets()
-tracked_tokens = DataManager.load_tokens()
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"/start от {update.effective_user.id}")
+    load_data()
+    await update.message.reply_text(
+        "🤖 **Привет! Я крипто-бот для отслеживания токенов и портфеля.**\n\n"
+        "📌 **ОСНОВНЫЕ ФУНКЦИИ:**\n"
+        "📋 **Watchlist** — отслеживание токенов с алертами\n"
+        "💼 **Мой портфель** — управление кошельками (Solana, ETH, Base, BSC)\n"
+        "📊 **Статистика** — общая информация\n\n"
+        "⚡ **КОМАНДЫ:**\n"
+        "/watchlist — список отслеживаемых токенов\n"
+        "/unwatch <адрес> — убрать токен\n"
+        "/price — цена BTC\n\n"
+        "Используй кнопки меню внизу!",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown"
+    )
 
-# Системы ограничений
-rate_limiter = RateLimiter()
 
-# Временные состояния
-pending_threshold_input: Dict[int, dict] = {}
-pending_wallet_input: Dict[int, dict] = {}
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "ℹ️ **КАК ИСПОЛЬЗОВАТЬ БОТ:**\n\n"
+        "📈 **WATCHLIST:**\n"
+        "• Отправь адрес токена\n"
+        "• Выбери параметры (цена, капа, объём)\n"
+        "• Получай алерты в реальном времени\n\n"
+        "💼 **ПОРТФЕЛЬ:**\n"
+        "• Добавь кошельки из 4 сетей\n"
+        "• Просматривай баланс и историю\n"
+        "• Обновляй баланс кнопкой\n\n"
+        "🌐 **ПОДДЕРЖИВАЕМЫЕ СЕТИ:**\n"
+        "🔹 Solana\n"
+        "🔹 Ethereum\n"
+        "🔹 Base\n"
+        "🔹 BSC (Binance Smart Chain)\n\n"
+        "💡 **СОВЕТ:** Начни с малых порогов (5-10%) в Watchlist!",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown"
+    )
 
-# ============ ОСНОВНЫЕ КЛАССЫ ============
 
-class WalletManager:
-    """Управление кошельками пользователей"""
-    
-    @staticmethod
-    def get_user_wallets(user_id: int) -> dict:
-        """Получает кошельки пользователя"""
-        if user_id not in user_wallets:
-            user_wallets[user_id] = {"wallets": {}, "last_update": 0}
-            DataManager.save_wallets(user_wallets)
-        return user_wallets[user_id]
-    
-    @staticmethod
-    def can_add_wallet(user_id: int) -> bool:
-        """Проверяет может ли пользователь добавить кошелек"""
-        user_data = WalletManager.get_user_wallets(user_id)
-        return len(user_data.get("wallets", {})) < MAX_WALLETS_PER_USER
-    
-    @staticmethod
-    def save_wallet(user_id: int, wallet_id: str, wallet_data: dict):
-        """Сохраняет кошелек"""
-        user_data = WalletManager.get_user_wallets(user_id)
-        user_data["wallets"][wallet_id] = wallet_data
-        DataManager.save_wallets(user_wallets)
+async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"/price от {update.effective_user.id}")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
+            ) as resp:
+                data = await resp.json()
 
-class TokenManager:
-    """Управление отслеживаемыми токенами"""
-    
-    @staticmethod
-    def can_add_token(user_id: int) -> bool:
-        """Проверяет может ли пользователь добавить токен"""
-        user_token_count = 0
-        for token_data in tracked_tokens.values():
-            if user_id in token_data.get("subscribers", {}):
-                user_token_count += 1
-        return user_token_count < MAX_TOKENS_PER_USER
-    
-    @staticmethod
-    def get_user_tokens_count(user_id: int) -> int:
-        """Возвращает количество токенов пользователя"""
-        count = 0
-        for token_data in tracked_tokens.values():
-            if user_id in token_data.get("subscribers", {}):
-                count += 1
-        return count
-    
-    @staticmethod
-    def save_tokens():
-        """Сохраняет токены"""
-        DataManager.save_tokens(tracked_tokens)
-
-# ============ ОБНОВЛЕННЫЕ ФУНКЦИИ ============
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик сообщений с проверкой лимитов"""
-    user_id = update.effective_user.id
-    text = (update.message.text or "").strip()
-    
-    # Проверка rate limit
-    if not await rate_limiter.check_user_limit(user_id):
+        btc_price = data["bitcoin"]["usd"]
         await update.message.reply_text(
-            "⚠️ Слишком много запросов. Подожди минуту.",
-            reply_markup=main_menu_keyboard()
+            f"₿ **Bitcoin:** ${btc_price:,.2f}", 
+            reply_markup=main_menu_keyboard(),
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        logger.error(f"Ошибка /price: {e}")
+        await update.message.reply_text("❌ Ошибка получения цены BTC")
+
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика"""
+    user_id = update.effective_user.id
+    
+    # Статистика Watchlist
+    total_tokens = 0
+    active_tokens = 0
+    disabled_tokens = 0
+    
+    for address, info in tracked_tokens.items():
+        sub = info.get("subscribers", {}).get(user_id)
+        if not sub:
+            continue
+        
+        total_tokens += 1
+        
+        pt = sub.get("price_threshold")
+        mt = sub.get("mcap_threshold")
+        vt = sub.get("vol_threshold")
+        
+        if pt is not None or mt is not None or vt is not None:
+            active_tokens += 1
+        else:
+            disabled_tokens += 1
+    
+    # Статистика Портфеля
+    user_data = get_user_wallets(user_id)
+    wallet_count = len(user_data.get("wallets", {}))
+    
+    stats_text = f"""
+📊 **СТАТИСТИКА:**
+
+🛰️ **WATCHLIST:**
+📈 Всего токенов: {total_tokens}
+🟢 Активных: {active_tokens}
+⚫ В списке (без алертов): {disabled_tokens}
+
+💼 **ПОРТФЕЛЬ:**
+🪙 Кошельков: {wallet_count}
+🌐 Сетей: Solana, Ethereum, Base, BSC
+
+💡 Совет: Используй /watchlist и 💼 Мой портфель для управления!
+    """
+    
+    await update.message.reply_text(stats_text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
+
+
+async def tools(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Инструменты и ссылки"""
+    tools_text = """
+🔗 **БЫСТРЫЕ ИНСТРУМЕНТЫ:**
+
+📊 **АНАЛИТИКА:**
+• DexScreener: https://dexscreener.com
+• Birdeye: https://birdeye.so
+• Defined.fi: https://defined.fi
+
+🔍 **СКАНЕРЫ БЛОКЧЕЙНА:**
+• Solscan: https://solscan.io
+• Etherscan: https://etherscan.io
+• BaseScan: https://basescan.org
+• BscScan: https://bscscan.com
+
+⚠️ **БЕЗОПАСНОСТЬ:**
+• Rugscreen: https://rugscreen.com
+• TokenSense: https://tokensense.io
+    """
+    
+    await update.message.reply_text(tools_text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
+
+
+async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Настройки"""
+    settings_text = """
+⚙️ **НАСТРОЙКИ:**
+
+🚀 В разработке:
+• Профиль пользователя
+• Язык интерфейса
+• Часовой пояс
+• Пороги уведомлений по умолчанию
+• Тихий режим
+• Приоритет сигналов
+
+Скоро будут доступны!
+    """
+    
+    await update.message.reply_text(settings_text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
+
+
+# ============ КОМАНДЫ ПОРТФЕЛЯ ============
+
+async def show_portfolio_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Главное меню портфеля"""
+    user_id = update.effective_user.id
+    user_data = get_user_wallets(user_id)
+    wallets = user_data.get("wallets", {})
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("➕ Добавить кошелек", callback_data="portfolio:add")],
+            [InlineKeyboardButton("👁️ Просмотреть портфель", callback_data="portfolio:view")],
+            [InlineKeyboardButton("🔄 Обновить баланс", callback_data="portfolio:refresh")],
+        ]
+    )
+
+    if wallets:
+        keyboard = InlineKeyboardMarkup(
+            list(keyboard.inline_keyboard)
+            + [[InlineKeyboardButton("🗑 Удалить кошелек", callback_data="portfolio:delete")]]
+        )
+
+    count = len(wallets)
+    text = (
+        f"💼 **МОЙ ПОРТФЕЛЬ**\n\n"
+        f"📥 Кошельков добавлено: **{count}**\n\n"
+        f"Что хочешь сделать?"
+    )
+
+    await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+
+
+async def view_portfolio_full(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просмотр полного портфеля"""
+    user_id = update.effective_user.id
+    message = update.effective_message
+    user_data = get_user_wallets(user_id)
+    wallets = user_data.get("wallets", {})
+
+    if not wallets:
+        await message.reply_text(
+            "💼 Твой портфель пуст!\n\n➕ Добавь кошелек, чтобы начать отслеживание.",
+            reply_markup=main_menu_keyboard(),
         )
         return
-    
+
+    text = "💼 **Твой ПОРТФЕЛЬ:**\n\n"
+    total_usd = 0
+
+    for wallet_id, wallet_info in wallets.items():
+        addr = wallet_info.get("address", "")
+        chain = wallet_info.get("chain", "")
+        name = wallet_info.get("name", chain)
+        balance = wallet_info.get("balance", 0)
+        usd = wallet_info.get("usd_value", 0)
+
+        total_usd += usd
+        emoji = {"solana": "🟣", "ethereum": "⚪", "base": "🔵", "bsc": "🟡"}.get(chain, "💫")
+
+        text += f"{emoji} **{name}** ({chain.upper()})\n"
+        text += f"   💰 {balance:.4f} | ${usd:,.2f}\n"
+        text += f"   {short_addr(addr)}\n\n"
+
+    text += f"**━━━━━━━━━━━━━━━━━━━━**\n"
+    text += f"**ИТОГО: ${total_usd:,.2f}**"
+
+    await message.reply_text(text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
+
+
+
+# ============ ОБРАБОТКА СООБЩЕНИЙ ============
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = (update.message.text or "").strip()
     logger.info(f"MSG от {user_id}: {text[:80]}")
-    
-    # Обработка кнопок главного меню (остается без изменений)
+
+    # Кнопки главного меню
     if text == "📋 Watchlist":
         await watchlist(update, context)
         return
-    
+
     if text == "💼 Мой портфель":
         await show_portfolio_menu(update, context)
         return
-    
-    # ... остальные обработчики кнопок
-    
+
+    if text == "❓ Справка":
+        await help_cmd(update, context)
+        return
+
+    if text == "📊 Статистика":
+        await stats(update, context)
+        return
+
+    if text == "🔗 Инструменты":
+        await tools(update, context)
+        return
+
+    if text == "⚙️ Настройки":
+        await settings(update, context)
+        return
+
     if text == "➕ Добавить токен":
-        if not TokenManager.can_add_token(user_id):
-            await update.message.reply_text(
-                f"❌ Достигнут лимит токенов ({MAX_TOKENS_PER_USER}). "
-                f"Удали некоторые токены чтобы добавить новые.",
-                reply_markup=main_menu_keyboard(),
-            )
-            return
-        
         await update.message.reply_text(
             "📍 Отправь адрес контракта токена, который хочешь отслеживать.\n\n"
             "Примеры:\n"
-            "• Solana: EPjFWdd5VqgQfm6ErMqPRyrEGSs2xKXWbdcZ3dWoE8Z\n"
+            "• Solana: EPjFWaLb3odcccccccccccccccccccccccccccccccccc\n"
             "• Ethereum: 0xdAC17F958D2ee523a2206206994597C13D831ec7 (USDT)\n"
             "• Base: 0x833589fCD6eDb6E08f4c7C32D4f71b1566dA3633 (USDC)",
             reply_markup=main_menu_keyboard(),
         )
         return
-    
-    # Обработка добавления кошелька
+
+    # ============ ОБРАБОТКА ПОРТФЕЛЯ ============
     if user_id in pending_wallet_input:
         state = pending_wallet_input[user_id]
         
@@ -290,29 +664,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         if state.get("step") == "address":
-            # Валидация адреса
-            if not AddressValidator.validate_address(text):
+            # Проверяем адрес
+            if len(text) < 30:
                 await update.message.reply_text(
-                    "❌ Неверный формат адреса. Проверь и отправь снова.\n\n"
-                    "EVM адреса должны начинаться с 0x и иметь 42 символа\n"
-                    "Solana адреса должны быть 32-44 символа",
+                    "❌ Адрес слишком короткий. Проверь и отправь снова.",
                     reply_markup=main_menu_keyboard()
                 )
-                return
-            
-            # Проверка лимита кошельков
-            if not WalletManager.can_add_wallet(user_id):
-                await update.message.reply_text(
-                    f"❌ Достигнут лимит кошельков ({MAX_WALLETS_PER_USER}). "
-                    f"Удали некоторые кошельки чтобы добавить новые.",
-                    reply_markup=main_menu_keyboard()
-                )
-                pending_wallet_input.pop(user_id, None)
                 return
             
             state["address"] = text
             state["step"] = "chain"
             
+            # Просим выбрать сеть
             keyboard = ReplyKeyboardMarkup(
                 [
                     [KeyboardButton("Solana"), KeyboardButton("Ethereum")],
@@ -329,43 +692,182 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        # ... остальная логика добавления кошелька
-    
-    # Обработка добавления токена
-    if len(text) > 20:  # Предположительно адрес токена
-        # Проверка лимита токенов
-        if not TokenManager.can_add_token(user_id):
+        if state.get("step") == "chain":
+            chain_map = {
+                "solana": "solana",
+                "ethereum": "ethereum",
+                "base": "base",
+                "bsc": "bsc"
+            }
+            
+            chain = chain_map.get(text.lower())
+            if not chain:
+                await update.message.reply_text(
+                    "❌ Выбери из предложенных вариантов.",
+                    reply_markup=main_menu_keyboard()
+                )
+                return
+            
+            state["chain"] = chain
+            state["step"] = "name"
+            
+            keyboard = ReplyKeyboardMarkup(
+                [[KeyboardButton("Отмена")]],
+                resize_keyboard=True,
+                one_time_keyboard=True
+            )
+            
             await update.message.reply_text(
-                f"❌ Достигнут лимит токенов ({MAX_TOKENS_PER_USER}). "
-                f"Удали некоторые токены чтобы добавить новые.",
+                "📝 Введи название для этого кошелька (например: 'Основной', 'Trading'):",
+                reply_markup=keyboard
+            )
+            return
+        
+        if state.get("step") == "name":
+            # Сохраняем кошелек
+            address = state["address"]
+            chain = state["chain"]
+            name = text if text != "Отмена" else chain.capitalize()
+            
+            user_data = get_user_wallets(user_id)
+            wallet_id = f"wallet_{len(user_data['wallets']) + 1}"
+            
+            user_data["wallets"][wallet_id] = {
+                "address": address,
+                "chain": chain,
+                "name": name,
+                "added_at": int(time.time()),
+                "balance": 0,
+                "usd_value": 0,
+                "balance_history": []
+            }
+            
+            save_data()
+            pending_wallet_input.pop(user_id, None)
+            
+            await update.message.reply_text(
+                f"✅ Кошелек **{name}** добавлен!\n\n"
+                f"🌐 Сеть: {chain.upper()}\n"
+                f"📍 {short_addr(address)}\n\n"
+                f"🔄 Обновляю баланс...",
+                reply_markup=main_menu_keyboard(),
+                parse_mode="Markdown"
+            )
+            
+            # Обновляем баланс сразу
+            await update_wallet_balance(user_id, wallet_id)
+            return
+
+    # ============ ОБРАБОТКА WATCHLIST ============
+    state = pending_threshold_input.get(user_id) or {
+        "pending_volume_for": None,
+        "pending_price_for": None,
+        "pending_mcap_for": None,
+        "pending_multi": None,
+        "multi_params": [],
+        "multi_step": 0,
+    }
+
+    # МНОЖЕСТВЕННЫЙ ВВОД ПАРАМЕТРОВ
+    if state.get("pending_multi"):
+        address = state["pending_multi"]
+        multi_params = state.get("multi_params", [])
+        multi_step = state.get("multi_step", 0)
+
+        try:
+            threshold = float(text.replace(",", "."))
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Не понял число. Введи %, например: 5",
                 reply_markup=main_menu_keyboard(),
             )
             return
-        
-        # Валидация адреса токена
-        if not AddressValidator.validate_address(text):
+
+        if threshold <= 0:
             await update.message.reply_text(
-                "❌ Неверный формат адреса токена. Проверь адрес и попробуй снова.",
-                reply_markup=main_menu_keyboard()
+                "❌ Порог должен быть > 0.",
+                reply_markup=main_menu_keyboard(),
             )
             return
-        
-        await process_token_address(update, context, text)
-        return
 
-async def process_token_address(update: Update, context: ContextTypes.DEFAULT_TYPE, address: str):
-    """Обрабатывает добавление токена с валидацией"""
-    user_id = update.effective_user.id
-    
+        info = tracked_tokens.get(address)
+        if not info:
+            await update.message.reply_text(
+                "❌ Этот контракт уже не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
+            pending_threshold_input.pop(user_id, None)
+            return
+
+        sub = ensure_subscriber(info, user_id)
+
+        # Заполняем пороги по очереди
+        if multi_step == 0 and "price" in multi_params:
+            sub["price_threshold"] = threshold
+            multi_step = 1
+            if "mcap" not in multi_params:
+                multi_step = 2
+            if "vol" not in multi_params and multi_step == 2:
+                multi_step = 3
+
+        elif multi_step == 1 and "mcap" in multi_params:
+            sub["mcap_threshold"] = threshold
+            multi_step = 2
+            if "vol" not in multi_params:
+                multi_step = 3
+
+        elif multi_step == 2 and "vol" in multi_params:
+            sub["vol_threshold"] = threshold
+            multi_step = 3
+
+        state["multi_step"] = multi_step
+        pending_threshold_input[user_id] = state
+
+        # Если все параметры введены
+        if multi_step >= 3:
+            label = format_addr_with_meta(address, info)
+            params_text = []
+            if sub.get("price_threshold") is not None:
+                params_text.append(f"📈 Цена: {sub['price_threshold']:.1f}%")
+            if sub.get("mcap_threshold") is not None:
+                params_text.append(f"🏦 Капа: {sub['mcap_threshold']:.1f}%")
+            if sub.get("vol_threshold") is not None:
+                params_text.append(f"🛰 Объём: {sub['vol_threshold']:.1f}%")
+
+            await update.message.reply_text(
+                f"✅ Отслеживание для {label} настроено:\n" + "\n".join(params_text),
+                reply_markup=main_menu_keyboard(),
+            )
+            state["pending_multi"] = None
+            state["multi_params"] = []
+            state["multi_step"] = 0
+            pending_threshold_input[user_id] = state
+            return
+
+        # Следующий параметр
+        next_param = None
+        if multi_step == 1 and "mcap" in multi_params:
+            next_param = "🏦 капитализации"
+        elif multi_step == 2 and "vol" in multi_params:
+            next_param = "🛰 объёма m5"
+
+        if next_param:
+            await update.message.reply_text(
+                f"Введи порог изменения {next_param} в %. Например: 10",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+    # Ввод других параметров watchlist...
+    # (остальной код для watchlist остаётся тот же)
+
+    # Если это адрес токена
+    address = text
     await update.message.reply_text(
-        f"🔍 Анализирую {address[:12]}...", 
-        reply_markup=main_menu_keyboard()
+        f"🔍 Анализирую {address[:12]}...", reply_markup=main_menu_keyboard()
     )
 
     try:
-        # Rate limit для внешних API
-        await rate_limiter.wait_if_needed()
-        
         async with aiohttp.ClientSession() as session:
             raw = await get_token_pairs_by_address(session, address)
             pair = pick_best_pair(raw)
@@ -373,8 +875,7 @@ async def process_token_address(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logger.error(f"Ошибка запроса токена {address}: {e}")
         await update.message.reply_text(
-            "❌ Ошибка запроса токена.", 
-            reply_markup=main_menu_keyboard()
+            "❌ Ошибка запроса токена.", reply_markup=main_menu_keyboard()
         )
         return
 
@@ -384,12 +885,23 @@ async def process_token_address(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=main_menu_keyboard(),
         )
         return
-    
-    # Сохраняем токен
+
     price_cur = float(pair.get("priceUsd", 0) or 0)
+
+    volume_info = pair.get("volume") or {}
+    vol_m5_cur = float(volume_info.get("m5", 0) or 0)
+    vol_24h_cur = float(volume_info.get("h24", 0) or 0)
+
+    mcap_cur = float(pair.get("marketCap") or pair.get("mcap") or 0)
+    fdv = float(pair.get("fdv") or 0)
+
+    if not mcap_cur and fdv:
+        mcap_cur = fdv
+
     symbol = pair["baseToken"]["symbol"]
     chain_id = pair.get("chainId")
-    
+    chain_name = map_chain(chain_id)
+
     info = tracked_tokens.get(address)
     if not info:
         info = {
@@ -399,19 +911,896 @@ async def process_token_address(update: Update, context: ContextTypes.DEFAULT_TY
         }
         tracked_tokens[address] = info
     else:
-        info["symbol"] = symbol
-        info["chain"] = chain_id
-    
-    # Сохраняем изменения
-    TokenManager.save_tokens()
-    
-    # Показываем интерфейс настройки (существующий код)
-    # ...
+        info.setdefault("symbol", symbol)
+        info.setdefault("chain", chain_id)
+        info.setdefault("subscribers", {})
 
-# ============ ОБНОВЛЕННАЯ ФУНКЦИЯ WATCHLIST ============
+    text_resp = (
+        f"💎 **{symbol}** ({chain_name})\n"
+        f"💰 Цена: ${price_cur:,.6f}\n"
+        f"🕒 Объём 5m: ${vol_m5_cur:,.0f}\n"
+        f"📊 Объём 24ч: ${vol_24h_cur:,.0f}\n"
+        f"🏦 Капитализация: ${mcap_cur:,.0f}\n"
+        f"🔗 [DexScreener]({pair['url']})"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📈 Цена", callback_data=f"select_price:{address}"
+                ),
+                InlineKeyboardButton(
+                    "🏦 Капа", callback_data=f"select_mcap:{address}"
+                ),
+                InlineKeyboardButton(
+                    "🛰 Объём", callback_data=f"select_vol:{address}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "✅ Все три параметра", callback_data=f"select_all:{address}"
+                ),
+            ],
+        ]
+    )
+
+    await update.message.reply_text(text_resp, reply_markup=keyboard, parse_mode="Markdown")
+# ------------ КНОПКИ ВЫБОРА ПАРАМЕТРОВ ============
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    
+    data = query.data or ""
+    user_id = query.from_user.id
+
+    logger.info(f"BTN от {user_id}: {data}")
+
+    # ============ ВСПЛЫВАЮЩИЕ ПОДСКАЗКИ (TOOLTIPS) ============
+    tooltips = {
+        "select_all": "✅ Включить все три параметра",
+        "select_price": "📈 Отслеживать изменение цены",
+        "select_mcap": "🏦 Отслеживать капитализацию",
+        "select_vol": "🛰 Отслеживать объём m5",
+        "menu": "👁️ Управление параметрами",
+        "menu_disabled": "🔄 Активировать параметры",
+        "disable_price": "❌ Отключить цену",
+        "disable_mcap": "❌ Отключить капу",
+        "disable_vol": "❌ Отключить объём",
+        "delete": "🗑️ Удалить из списка",
+        "pin": "📌 Оставить в списке",
+        "back_to_watchlist": "⬅️ Вернуться в Watchlist",
+    }
+
+    # Определяем тип кнопки для tooltip
+    tooltip_key = None
+    for key in tooltips:
+        if data.startswith(key):
+            tooltip_key = key
+            break
+    
+    if tooltip_key:
+        await query.answer(tooltips[tooltip_key], show_alert=False)
+    else:
+        await query.answer()
+
+    state = pending_threshold_input.get(user_id) or {
+        "pending_volume_for": None,
+        "pending_price_for": None,
+        "pending_mcap_for": None,
+        "pending_multi": None,
+        "multi_params": [],
+        "multi_step": 0,
+    }
+
+    # ============ ВЫБОР ВСЕХ ТРЁХ ПАРАМЕТРОВ ============
+    if data.startswith("select_all:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_multi"] = address
+        state["multi_params"] = ["price", "mcap", "vol"]
+        state["multi_step"] = 0
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"📈 Введи порог изменения цены в % для {label}.\n"
+            f"Например: 5",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # ============ ВЫБОР ОДНОГО ПАРАМЕТРА ============
+    if data.startswith("select_price:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_price_for"] = address
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"📈 Введи порог изменения цены в % для {label}.\n"
+            f"Например: 5",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    if data.startswith("select_mcap:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_mcap_for"] = address
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"🏦 Введи порог изменения капитализации в % для {label}.\n"
+            f"Например: 10",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    if data.startswith("select_vol:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_volume_for"] = address
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"🛰 Введи порог изменения объёма m5 в % для {label}.\n"
+            f"Например: 20",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # ============ МЕНЮ ОТКЛЮЧЁННОГО ТОКЕНА (В СПИСКЕ) ============
+    if data.startswith("menu_disabled:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text(
+                "⚠️ Этот токен больше не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        symbol = info.get("symbol", "")
+        short_address = short_addr(address)
+
+        text = (
+            f"📌 {symbol} {short_address}\n\n"
+            f"⛔ Отслеживание отключено\n\n"
+            f"Выбери параметры для подключения:"
+        )
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "📈 Цена", callback_data=f"select_price:{address}"
+                    ),
+                    InlineKeyboardButton(
+                        "🏦 Капа", callback_data=f"select_mcap:{address}"
+                    ),
+                    InlineKeyboardButton(
+                        "🛰 Объём", callback_data=f"select_vol:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✅ Все три", callback_data=f"select_all:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🛑 Удалить из списка", callback_data=f"delete:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад", callback_data="back_to_watchlist"
+                    ),
+                ],
+            ]
+        )
+
+        await query.edit_message_text(text=text, reply_markup=keyboard)
+        return
+
+    # ============ ДЕТАЛЬНОЕ МЕНЮ ТОКЕНА ИЗ WATCHLIST ============
+    if data.startswith("menu:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text(
+                "⚠️ Этот токен больше не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        sub = info["subscribers"][user_id]
+        symbol = info.get("symbol", "")
+        short_address = short_addr(address)
+
+        vt = sub.get("vol_threshold")
+        pt = sub.get("price_threshold")
+        mt = sub.get("mcap_threshold")
+
+        status_lines = [f"📌 **{symbol}** {short_address}"]
+        status_lines.append("")
+        status_lines.append("**ПАРАМЕТРЫ:**")
+        
+        if pt is not None:
+            status_lines.append(f"✅ 📈 Цена: {pt:.1f}%")
+        else:
+            status_lines.append(f"⛔ 📈 Цена: отключена")
+
+        if mt is not None:
+            status_lines.append(f"✅ 🏦 Капа: {mt:.1f}%")
+        else:
+            status_lines.append(f"⛔ 🏦 Капа: отключена")
+
+        if vt is not None:
+            status_lines.append(f"✅ 🛰 Объём: {vt:.1f}%")
+        else:
+            status_lines.append(f"⛔ 🛰 Объём: отключен")
+
+        # Анализ памп/дамп
+        pump_dump = detect_pump_dump(sub.get("volume_history", deque()))
+        if pump_dump:
+            status_lines.append("")
+            status_lines.append(f"⚡ {pump_dump}")
+
+        text = "\n".join(status_lines)
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "❌ Цена", callback_data=f"disable_price:{address}"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Капа", callback_data=f"disable_mcap:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "❌ Объём", callback_data=f"disable_vol:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📌 Оставить в списке", callback_data=f"pin:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🛑 Удалить полностью", callback_data=f"delete:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад", callback_data="back_to_watchlist"
+                    ),
+                ],
+            ]
+        )
+
+        await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+        return
+
+    # ============ ОБНУЛЕНИЕ ПОРОГОВ ============
+    if data.startswith("pin:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text("⚠️ Токен не найден.")
+            return
+
+        sub = info["subscribers"][user_id]
+        sub["vol_threshold"] = None
+        sub["price_threshold"] = None
+        sub["mcap_threshold"] = None
+
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"📌 {label} остался в списке, но все пороги сброшены.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # ============ УДАЛЕНИЕ ТОКЕНА ============
+    if data.startswith("delete:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text("⚠️ Токен не найден.")
+            return
+
+        label = format_addr_with_meta(address, info)
+        info["subscribers"].pop(user_id, None)
+
+        if not info["subscribers"]:
+            tracked_tokens.pop(address, None)
+
+        state = pending_threshold_input.get(user_id)
+        if state:
+            if state.get("pending_volume_for") == address:
+                state["pending_volume_for"] = None
+            if state.get("pending_price_for") == address:
+                state["pending_price_for"] = None
+            if state.get("pending_mcap_for") == address:
+                state["pending_mcap_for"] = None
+            if state.get("pending_multi") == address:
+                state["pending_multi"] = None
+            pending_threshold_input[user_id] = state
+
+        await query.message.reply_text(
+            f"🛑 {label} удален из Watchlist.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # ============ НАЗАД В WATCHLIST ============
+    if data == "back_to_watchlist":
+        await watchlist(update, context)
+        return
+
+    # ============ ОТКЛЮЧЕНИЕ ИЗ АЛЕРТА ============
+    if data.startswith("disable_"):
+        prefix, address = data.split(":", 1)
+        kind = prefix.replace("disable_", "")
+
+        info = tracked_tokens.get(address)
+        if not info:
+            await query.message.reply_text(
+                "⚠️ Этот токен уже не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        subs = info.get("subscribers", {})
+        sub = subs.get(user_id)
+
+        if not sub:
+            await query.message.reply_text(
+                "⚠️ Подписка для этого токена уже снята.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        label = format_addr_with_meta(address, info)
+
+        if kind == "price":
+            sub["price_threshold"] = None
+            await query.message.reply_text(
+                f"✅ Отключены алерты цены для {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
+
+        elif kind == "mcap":
+            sub["mcap_threshold"] = None
+            await query.message.reply_text(
+                f"✅ Отключены алерты капы для {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
+
+        elif kind == "vol":
+            sub["vol_threshold"] = None
+            await query.message.reply_text(
+                f"✅ Отключены алерты объёма для {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
+
+        elif kind == "all":
+            subs.pop(user_id, None)
+            if not subs:
+                tracked_tokens.pop(address, None)
+
+            await query.message.reply_text(
+                f"🛑 Полностью отключено отслеживание {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
+
+
+# ============ ФУНКЦИЯ ОБНОВЛЕНИЯ БАЛАНСА ============
+
+async def update_wallet_balance(user_id: int, wallet_id: str):
+    """Обновляет баланс кошелька"""
+    user_data = get_user_wallets(user_id)
+    wallet = user_data["wallets"].get(wallet_id)
+    
+    if not wallet:
+        return
+    
+    address = wallet["address"]
+    chain = wallet["chain"]
+    
+    if chain == "solana":
+        balance_data = await get_solana_balance(address)
+    else:
+        balance_data = await get_evm_portfolio_moralis(address, chain)
+    
+    wallet["balance"] = balance_data.get("balance", 0)
+    wallet["usd_value"] = balance_data.get("usd_value", 0)
+    wallet["last_updated"] = int(time.time())
+    
+    # Добавляем в историю
+    if "balance_history" not in wallet:
+        wallet["balance_history"] = []
+    
+    wallet["balance_history"].append({
+        "timestamp": int(time.time()),
+        "usd_value": wallet["usd_value"]
+    })
+    
+    # Держим только последние 168 записей (1 неделя при обновлении каждые 10 минут)
+    if len(wallet["balance_history"]) > 168:
+        wallet["balance_history"] = wallet["balance_history"][-168:]
+    
+    save_data()
+
+
+# ============ CALLBACK HANDLER (КНОПКИ) ============
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data or ""
+    user_id = query.from_user.id
+
+    logger.info(f"BTN от {user_id}: {data}")
+
+    # если дальше есть tooltips – можно вставить сюда, а затем:
+    await query.answer()
+
+    # ============ ПОРТФЕЛЬ CALLBACKS ============
+
+    if data == "portfolio:add":
+        keyboard = ReplyKeyboardMarkup(
+            [[KeyboardButton("Отмена")]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+
+        await query.message.reply_text(
+            "📍 Отправь адрес кошелька (Solana, Ethereum, Base или BSC):",
+            reply_markup=keyboard
+        )
+
+        pending_wallet_input[user_id] = {"step": "address"}
+        return
+
+    if data == "portfolio:view":
+        await view_portfolio_full(update, context)
+        return
+
+    if data == "portfolio:refresh":
+        user_data = get_user_wallets(user_id)
+        wallets = user_data.get("wallets", {})
+
+        if not wallets:
+            await query.message.reply_text("💼 Портфель пуст!")
+            return
+
+        await query.message.reply_text("🔄 Обновляю балансы... (это может занять 30 сек)")
+
+        for wallet_id in wallets:
+            await update_wallet_balance(user_id, wallet_id)
+
+        await view_portfolio_full(update, context)
+        return
+
+    if data == "portfolio:back":
+        await show_portfolio_menu(update, context)
+        return
+
+    if data == "portfolio:delete":
+        user_data = get_user_wallets(user_id)
+        wallets = user_data.get("wallets", {})
+
+        if not wallets:
+            await query.message.reply_text("💼 Нет кошельков для удаления!")
+            return
+
+        keyboard = []
+        for wallet_id, wallet_info in wallets.items():
+            name = wallet_info.get("name", "")
+            keyboard.append(
+                [InlineKeyboardButton(f"🗑️ {name}", callback_data=f"wallet_delete:{wallet_id}")]
+            )
+
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="portfolio:back")])
+
+        await query.edit_message_text(
+            text="🗑️ Выбери кошелек для удаления:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    if data.startswith("wallet_delete:"):
+        wallet_id = data.split(":", 1)[1]
+        user_data = get_user_wallets(user_id)
+
+        if wallet_id in user_data["wallets"]:
+            del user_data["wallets"][wallet_id]
+            save_data()
+            await query.message.reply_text("✅ Кошелек удален!")
+
+        await show_portfolio_menu(update, context)
+        return
+
+    # ============ WATCHLIST CALLBACKS ============
+
+    state = pending_threshold_input.get(user_id) or {
+        "pending_volume_for": None,
+        "pending_price_for": None,
+        "pending_mcap_for": None,
+        "pending_multi": None,
+        "multi_params": [],
+        "multi_step": 0,
+    }
+
+    # ВСЕ ТРИ ПАРАМЕТРА
+    if data.startswith("select_all:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_multi"] = address
+        state["multi_params"] = ["price", "mcap", "vol"]
+        state["multi_step"] = 0
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"📈 Введи порог изменения цены в % для {label}.\n"
+            f"Например: 5",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # ОТДЕЛЬНЫЕ ПАРАМЕТРЫ
+    if data.startswith("select_price:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_price_for"] = address
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"📈 Введи порог изменения цены в % для {label}.\n"
+            f"Например: 5",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    if data.startswith("select_mcap:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_mcap_for"] = address
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"🏦 Введи порог изменения капитализации в % для {label}.\n"
+            f"Например: 10",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    if data.startswith("select_vol:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.setdefault(
+            address, {"symbol": None, "chain": None, "subscribers": {}}
+        )
+
+        ensure_subscriber(info, user_id)
+        state["pending_volume_for"] = address
+        pending_threshold_input[user_id] = state
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"🛰 Введи порог изменения объёма m5 в % для {label}.\n"
+            f"Например: 20",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # МЕНЮ ОТКЛЮЧЁННОГО ТОКЕНА
+    if data.startswith("menu_disabled:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text(
+                "⚠️ Этот токен больше не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        symbol = info.get("symbol", "")
+        short_address = short_addr(address)
+
+        text = (
+            f"📌 {symbol} {short_address}\n\n"
+            f"⛔ Отслеживание отключено\n\n"
+            f"Выбери параметры для подключения:"
+        )
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "📈 Цена", callback_data=f"select_price:{address}"
+                    ),
+                    InlineKeyboardButton(
+                        "🏦 Капа", callback_data=f"select_mcap:{address}"
+                    ),
+                    InlineKeyboardButton(
+                        "🛰 Объём", callback_data=f"select_vol:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✅ Все три", callback_data=f"select_all:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🛑 Удалить из списка", callback_data=f"delete:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад", callback_data="back_to_watchlist"
+                    ),
+                ],
+            ]
+        )
+
+        await query.edit_message_text(text=text, reply_markup=keyboard)
+        return
+
+    # МЕНЮ АКТИВНОГО ТОКЕНА
+    if data.startswith("menu:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text(
+                "⚠️ Этот токен больше не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        sub = info["subscribers"][user_id]
+        symbol = info.get("symbol", "")
+        short_address = short_addr(address)
+
+        vt = sub.get("vol_threshold")
+        pt = sub.get("price_threshold")
+        mt = sub.get("mcap_threshold")
+
+        status_lines = [f"📌 **{symbol}** {short_address}"]
+        status_lines.append("")
+        status_lines.append("**ПАРАМЕТРЫ:**")
+        
+        if pt is not None:
+            status_lines.append(f"✅ 📈 Цена: {pt:.1f}%")
+        else:
+            status_lines.append(f"⛔ 📈 Цена: отключена")
+
+        if mt is not None:
+            status_lines.append(f"✅ 🏦 Капа: {mt:.1f}%")
+        else:
+            status_lines.append(f"⛔ 🏦 Капа: отключена")
+
+        if vt is not None:
+            status_lines.append(f"✅ 🛰 Объём: {vt:.1f}%")
+        else:
+            status_lines.append(f"⛔ 🛰 Объём: отключен")
+
+        pump_dump = detect_pump_dump(sub.get("volume_history", deque()))
+        if pump_dump:
+            status_lines.append("")
+            status_lines.append(f"⚡ {pump_dump}")
+
+        text = "\n".join(status_lines)
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "❌ Цена", callback_data=f"disable_price:{address}"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Капа", callback_data=f"disable_mcap:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "❌ Объём", callback_data=f"disable_vol:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📌 Оставить в списке", callback_data=f"pin:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🛑 Удалить полностью", callback_data=f"delete:{address}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад", callback_data="back_to_watchlist"
+                    ),
+                ],
+            ]
+        )
+
+        await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+        return
+
+    # СБРОС ПОРОГОВ
+    if data.startswith("pin:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text("⚠️ Токен не найден.")
+            return
+
+        sub = info["subscribers"][user_id]
+        sub["vol_threshold"] = None
+        sub["price_threshold"] = None
+        sub["mcap_threshold"] = None
+
+        label = format_addr_with_meta(address, info)
+        await query.message.reply_text(
+            f"📌 {label} остался в списке, но все пороги сброшены.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # УДАЛЕНИЕ ТОКЕНА
+    if data.startswith("delete:"):
+        address = data.split(":", 1)[1]
+        info = tracked_tokens.get(address)
+
+        if not info or user_id not in info.get("subscribers", {}):
+            await query.message.reply_text("⚠️ Токен не найден.")
+            return
+
+        label = format_addr_with_meta(address, info)
+        info["subscribers"].pop(user_id, None)
+
+        if not info["subscribers"]:
+            tracked_tokens.pop(address, None)
+
+        state = pending_threshold_input.get(user_id)
+        if state:
+            if state.get("pending_volume_for") == address:
+                state["pending_volume_for"] = None
+            if state.get("pending_price_for") == address:
+                state["pending_price_for"] = None
+            if state.get("pending_mcap_for") == address:
+                state["pending_mcap_for"] = None
+            if state.get("pending_multi") == address:
+                state["pending_multi"] = None
+            pending_threshold_input[user_id] = state
+
+        await query.message.reply_text(
+            f"🛑 {label} удален из Watchlist.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # НАЗАД В WATCHLIST
+    if data == "back_to_watchlist":
+        await watchlist(update, context)
+        return
+
+    # ОТКЛЮЧЕНИЕ ПАРАМЕТРОВ ИЗ АЛЕРТА
+    if data.startswith("disable_"):
+        prefix, address = data.split(":", 1)
+        kind = prefix.replace("disable_", "")
+
+        info = tracked_tokens.get(address)
+        if not info:
+            await query.message.reply_text(
+                "⚠️ Этот токен уже не отслеживается.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        subs = info.get("subscribers", {})
+        sub = subs.get(user_id)
+
+        if not sub:
+            await query.message.reply_text(
+                "⚠️ Подписка для этого токена уже снята.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        label = format_addr_with_meta(address, info)
+
+        if kind == "price":
+            sub["price_threshold"] = None
+            await query.message.reply_text(
+                f"✅ Отключены алерты цены для {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
+
+        elif kind == "mcap":
+            sub["mcap_threshold"] = None
+            await query.message.reply_text(
+                f"✅ Отключены алерты капы для {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
+
+        elif kind == "vol":
+            sub["vol_threshold"] = None
+            await query.message.reply_text(
+                f"✅ Отключены алерты объёма для {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
+
+        elif kind == "all":
+            subs.pop(user_id, None)
+            if not subs:
+                tracked_tokens.pop(address, None)
+
+            await query.message.reply_text(
+                f"🛑 Полностью отключено отслеживание {label}.",
+                reply_markup=main_menu_keyboard(),
+            )
+
+
+# ============ WATCHLIST ============
 
 async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Просмотр Watchlist с информацией о лимитах"""
+    """Просмотр Watchlist"""
     user_id = update.effective_user.id
 
     items_active = []
@@ -447,14 +1836,11 @@ async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
             btn_text = f"{symbol} {short_address} ⛔"
             items_disabled.append((address, btn_text, "menu_disabled"))
 
-    current_count = len(items_active) + len(items_disabled)
-    
     if not items_active and not items_disabled:
-        text = (
-            "👀 Сейчас ты ничего не отслеживаешь.\n\n"
-            f"📊 Лимит: {MAX_TOKENS_PER_USER} токенов"
+        await update.message.reply_text(
+            "👀 Сейчас ты ничего не отслеживаешь.",
+            reply_markup=main_menu_keyboard(),
         )
-        await update.message.reply_text(text, reply_markup=main_menu_keyboard())
         return
 
     keyboard_buttons = []
@@ -476,221 +1862,288 @@ async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = InlineKeyboardMarkup(keyboard_buttons)
 
-    text = (
-        f"🛰 **Твой Watchlist:** {current_count}/{MAX_TOKENS_PER_USER}\n\n"
-        "Нажми на токен для управления:"
-    )
+    text = "🛰 **Твой Watchlist:**\n\nНажми на токен для управления:"
     await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
-# ============ ОБНОВЛЕННАЯ ФУНКЦИЯ PORTFOLIO ============
 
-async def show_portfolio_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Главное меню портфеля с информацией о лимитах"""
+async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удалить токен из watchlist"""
     user_id = update.effective_user.id
-    user_data = WalletManager.get_user_wallets(user_id)
-    wallets = user_data.get("wallets", {})
-    
-    current_count = len(wallets)
-    max_count = MAX_WALLETS_PER_USER
 
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("➕ Добавить кошелек", callback_data="portfolio:add")],
-            [InlineKeyboardButton("👁️ Просмотреть портфель", callback_data="portfolio:view")],
-            [InlineKeyboardButton("🔄 Обновить баланс", callback_data="portfolio:refresh")],
-        ]
-    )
-
-    if wallets:
-        keyboard = InlineKeyboardMarkup(
-            list(keyboard.inline_keyboard)
-            + [[InlineKeyboardButton("🗑 Удалить кошелек", callback_data="portfolio:delete")]]
+    if not context.args:
+        await update.message.reply_text(
+            "Используй: /unwatch <адрес_контракта>",
+            reply_markup=main_menu_keyboard(),
         )
+        return
 
-    text = (
-        f"💼 **МОЙ ПОРТФЕЛЬ**\n\n"
-        f"📥 Кошельков: **{current_count}/{max_count}**\n\n"
-        f"Что хочешь сделать?"
+    address = context.args[0].strip()
+
+    info = tracked_tokens.get(address)
+    if not info or user_id not in info.get("subscribers", {}):
+        await update.message.reply_text(
+            "❌ Этот адрес ты сейчас не отслеживаешь.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    info["subscribers"].pop(user_id, None)
+
+    if not info["subscribers"]:
+        tracked_tokens.pop(address, None)
+
+    state = pending_threshold_input.get(user_id)
+    if state:
+        if state.get("pending_volume_for") == address:
+            state["pending_volume_for"] = None
+        if state.get("pending_price_for") == address:
+            state["pending_price_for"] = None
+        if state.get("pending_mcap_for") == address:
+            state["pending_mcap_for"] = None
+        if state.get("pending_multi") == address:
+            state["pending_multi"] = None
+        pending_threshold_input[user_id] = state
+
+    label = format_addr_with_meta(address, info or {})
+    await update.message.reply_text(
+        f"✅ Отключил отслеживание для {label}.",
+        reply_markup=main_menu_keyboard(),
     )
 
-    await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+# ============ ФОНОВЫЙ МОНИТОР ============
 
-# ============ ОБНОВЛЕННЫЙ MARKET WATCHER ============
+def analyze_volume_windows(history: deque, current_ts: float) -> dict:
+    """Анализирует объёмы по временным окнам"""
+    windows = {
+        "5s": 5,
+        "10s": 10,
+        "20s": 20,
+        "30s": 30,
+    }
+    
+    result = {}
+    
+    for label, span in windows.items():
+        recent = [vol for ts, vol in history if current_ts - ts <= span]
+        if len(recent) < 2:
+            continue
+        
+        change = ((recent[-1] - recent[0]) / recent[0] * 100) if recent[0] > 0 else 0
+        result[label] = change
+    
+    return result
+
 
 async def market_watcher(app: Application):
-    """Фоновый мониторинг с улучшенной обработкой ошибок"""
+    """Фоновый мониторинг токенов и портфеля"""
     logger.info("🚀 Market watcher запущен")
 
     while True:
         try:
+            # ============ ОБНОВЛЕНИЕ WATCHLIST ============
             if tracked_tokens:
                 async with aiohttp.ClientSession() as session:
                     for address, info in list(tracked_tokens.items()):
-                        try:
-                            # Rate limit для DexScreener API
-                            await rate_limiter.wait_if_needed()
-                            
-                            subs = info.get("subscribers") or {}
-                            if not subs:
-                                continue
+                        subs = info.get("subscribers") or {}
 
+                        if not subs:
+                            continue
+
+                        try:
                             raw = await get_token_pairs_by_address(session, address)
                             pair = pick_best_pair(raw)
-
-                            if not pair:
-                                logger.warning(f"Нет пары для {address}")
-                                continue
-
-                            # Обработка данных токена...
-                            # (существующая логика обработки алертов)
 
                         except Exception as e:
                             logger.error(f"Ошибка обновления токена {address[:8]}: {e}")
                             continue
 
-                        # Задержка между запросами для соблюдения rate limit
-                        await asyncio.sleep(API_RATE_LIMIT_DELAY)
+                        if not pair:
+                            logger.warning(f"Нет пары для {address}")
+                            continue
 
-            # Сохраняем состояние токенов периодически
-            TokenManager.save_tokens()
+                        price_cur = float(pair.get("priceUsd", 0) or 0)
+
+                        volume_info = pair.get("volume") or {}
+                        vol_m5_cur = float(volume_info.get("m5", 0) or 0)
+
+                        try:
+                            trades = pair.get("trades") or {}
+                            buy_vol = float(trades.get("h1Buy", 0) or 0)
+                            sell_vol = float(trades.get("h1Sell", 0) or 0)
+                        except:
+                            buy_vol = vol_m5_cur * 0.5
+                            sell_vol = vol_m5_cur * 0.5
+
+                        mcap_cur = float(pair.get("marketCap") or pair.get("mcap") or 0)
+                        fdv = float(pair.get("fdv") or 0)
+
+                        if not mcap_cur and fdv:
+                            mcap_cur = fdv
+
+                        symbol = info.get("symbol") or pair["baseToken"]["symbol"]
+                        info["symbol"] = symbol
+                        info.setdefault("chain", pair.get("chainId"))
+
+                        for uid, cfg in list(subs.items()):
+                            if cfg.get("last_price") is None:
+                                cfg["last_price"] = price_cur
+                                cfg["last_volume_m5"] = vol_m5_cur
+                                cfg["last_mcap"] = mcap_cur
+                                cfg["last_ts"] = time.time()
+                                cfg["volume_history"].append((time.time(), buy_vol, sell_vol))
+                                continue
+
+                            now_ts = time.time()
+                            cfg["volume_history"].append((now_ts, buy_vol, sell_vol))
+
+                            price_delta = pct_change(price_cur, cfg["last_price"])
+                            vol_delta = pct_change(vol_m5_cur, cfg["last_volume_m5"])
+                            mcap_delta = pct_change(mcap_cur, cfg["last_mcap"])
+
+                            pt = cfg.get("price_threshold")
+                            vt = cfg.get("vol_threshold")
+                            mt = cfg.get("mcap_threshold")
+
+                            triggered = False
+                            reason_lines = []
+
+                            if (
+                                pt is not None
+                                and price_delta is not None
+                                and abs(price_delta) >= pt
+                            ):
+                                direction = "⬆️" if price_delta > 0 else "⬇️"
+                                reason_lines.append(f"{direction} Цена: {price_delta:.2f}%")
+                                triggered = True
+
+                            if (
+                                not triggered
+                                and mt is not None
+                                and mcap_delta is not None
+                                and abs(mcap_delta) >= mt
+                            ):
+                                direction = "⬆️" if mcap_delta > 0 else "⬇️"
+                                reason_lines.append(
+                                    f"{direction} Капитализация: {mcap_delta:.2f}%"
+                                )
+                                triggered = True
+
+                            if (
+                                not triggered
+                                and vt is not None
+                                and vol_delta is not None
+                                and abs(vol_delta) >= vt
+                            ):
+                                direction = "⬆️" if vol_delta > 0 else "⬇️"
+                                reason_lines.append(f"{direction} Объём m5: {vol_delta:.2f}%")
+                                triggered = True
+
+                            if not triggered:
+                                continue
+
+                            vol_windows = analyze_volume_windows(
+                                deque([(t, v) for t, _, v in cfg["volume_history"]]), now_ts
+                            )
+
+                            extra_lines = []
+                            if price_delta is not None:
+                                extra_lines.append(f"Цена: {price_delta:+.2f}%")
+                            if mcap_delta is not None:
+                                extra_lines.append(f"Капитализация: {mcap_delta:+.2f}%")
+                            if vol_delta is not None:
+                                extra_lines.append(f"Объём m5: {vol_delta:+.2f}%")
+
+                            for window_label, window_change in vol_windows.items():
+                                if window_change != 0:
+                                    extra_lines.append(f"Объём {window_label}: {window_change:+.1f}%")
+
+                            pump_dump = detect_pump_dump(cfg["volume_history"])
+
+                            label = format_addr_with_meta(address, info)
+
+                            last_alert_ts = cfg.get("last_alert_ts") or 0
+                            time_since_alert = now_ts - last_alert_ts
+                            time_str = f"{int(time_since_alert)}s" if time_since_alert < 60 else f"{int(time_since_alert / 60)}m"
+
+                            msg = (
+                                f"🚨 {symbol}\n{label}\n\n"
+                                f"{'; '.join(reason_lines)}\n\n"
+                                f"Текущие значения:\n"
+                                f"💰 Цена: ${price_cur:,.6f}\n"
+                                f"🕒 Объём 5m: ${vol_m5_cur:,.0f}\n"
+                                f"🏦 Капитализация: ${mcap_cur:,.0f}\n\n"
+                                f"Изменение от предыдущего состояния:\n"
+                                f"{'; '.join(extra_lines)}"
+                            )
+
+                            if pump_dump:
+                                msg += f"\n\n⚡ {pump_dump}"
+
+                            msg += f"\n\n⏱️ От последнего сигнала: {time_str}"
+
+                            keyboard = InlineKeyboardMarkup(
+                                [
+                                    [
+                                        InlineKeyboardButton(
+                                            "❌ Цена",
+                                            callback_data=f"disable_price:{address}",
+                                        ),
+                                        InlineKeyboardButton(
+                                            "❌ Капа",
+                                            callback_data=f"disable_mcap:{address}",
+                                        ),
+                                    ],
+                                    [
+                                        InlineKeyboardButton(
+                                            "❌ Объём",
+                                            callback_data=f"disable_vol:{address}",
+                                        ),
+                                        InlineKeyboardButton(
+                                            "🛑 Всё",
+                                            callback_data=f"disable_all:{address}",
+                                        ),
+                                    ],
+                                ]
+                            )
+
+                            try:
+                                await app.bot.send_message(
+                                    chat_id=uid,
+                                    text=msg,
+                                    reply_markup=keyboard,
+                                    parse_mode="Markdown",
+                                )
+
+                                logger.info(f"Алёрт отправлен {uid} для {address[:8]}")
+                                cfg["last_alert_ts"] = now_ts
+
+                            except Exception as e:
+                                logger.error(f"Ошибка отправки алерта {uid}: {e}")
+
+                            cfg["last_price"] = price_cur
+                            cfg["last_volume_m5"] = vol_m5_cur
+                            cfg["last_mcap"] = mcap_cur
+                            cfg["last_ts"] = time.time()
+
             await asyncio.sleep(5)
 
         except Exception as e:
             logger.error(f"Критическая ошибка market_watcher: {e}")
             await asyncio.sleep(10)
 
-# ============ ОБНОВЛЕННЫЕ КОМАНДЫ ============
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда start с информацией о лимитах"""
-    logger.info(f"/start от {update.effective_user.id}")
-    
-    await update.message.reply_text(
-        "🤖 **Привет! Я крипто-бот для отслеживания токенов и портфеля.**\n\n"
-        "📌 **ОСНОВНЫЕ ФУНКЦИИ:**\n"
-        f"📋 **Watchlist** — отслеживание до {MAX_TOKENS_PER_USER} токенов\n"
-        f"💼 **Мой портфель** — до {MAX_WALLETS_PER_USER} кошельков\n"
-        "📊 **Статистика** — общая информация\n\n"
-        "⚡ **КОМАНДЫ:**\n"
-        "/watchlist — список отслеживаемых токенов\n"
-        "/unwatch <адрес> — убрать токен\n"
-        "/price — цена BTC\n\n"
-        "Используй кнопки меню внизу!",
-        reply_markup=main_menu_keyboard(),
-        parse_mode="Markdown"
-    )
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Статистика с информацией о лимитах"""
-    user_id = update.effective_user.id
-    
-    # Статистика Watchlist
-    token_count = TokenManager.get_user_tokens_count(user_id)
-    
-    # Статистика Портфеля
-    user_data = WalletManager.get_user_wallets(user_id)
-    wallet_count = len(user_data.get("wallets", {}))
-    
-    stats_text = f"""
-📊 **СТАТИСТИКА:**
-
-🛰️ **WATCHLIST:**
-📈 Токенов: {token_count}/{MAX_TOKENS_PER_USER}
-🌐 Всего в системе: {len(tracked_tokens)} токенов
-
-💼 **ПОРТФЕЛЬ:**
-🪙 Кошельков: {wallet_count}/{MAX_WALLETS_PER_USER}
-🌐 Сетей: Solana, Ethereum, Base, BSC
-
-⚡ **СИСТЕМА:**
-🛡️ Валидация адресов: ✅
-📊 Rate limiting: ✅
-💾 Сохранение данных: ✅
-    """
-    
-    await update.message.reply_text(stats_text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
-
-# ============ УТИЛИТЫ (без изменений) ============
-
-def main_menu_keyboard() -> ReplyKeyboardMarkup:
-    """Главное меню с кнопками"""
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("➕ Добавить токен"), KeyboardButton("📋 Watchlist")],
-            [KeyboardButton("💼 Мой портфель"), KeyboardButton("📊 Статистика")],
-            [KeyboardButton("🔗 Инструменты"), KeyboardButton("⚙️ Настройки")],
-            [KeyboardButton("❓ Справка")],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=False,
-    )
-
-def short_addr(address: str) -> str:
-    """Сокращает адрес: первые 4 + ... + последние 4 символа"""
-    if len(address) <= 10:
-        return address
-    return f"{address[:4]}...{address[-4:]}"
-
-def ensure_subscriber(info: dict, user_id: int) -> dict:
-    """Создает подписчика если не существует"""
-    subs = info.setdefault("subscribers", {})
-    sub = subs.get(user_id)
-
-    if not sub:
-        sub = {
-            "vol_threshold": None,
-            "price_threshold": None,
-            "mcap_threshold": None,
-            "last_price": None,
-            "last_volume_m5": None,
-            "last_mcap": None,
-            "last_ts": None,
-            "last_alert_ts": None,
-            "volume_history": deque(maxlen=200),
-        }
-        subs[user_id] = sub
-        # Сохраняем изменения при создании нового подписчика
-        TokenManager.save_tokens()
-
-    return sub
-
-# ============ ИНИЦИАЛИЗАЦИЯ ============
 
 async def post_init(app: Application):
-    """Инициализация при запуске"""
     logger.info("post_init: запускаем фоновые задачи")
-    # Данные уже загружены при инициализации
+    load_data()
     asyncio.create_task(market_watcher(app))
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик команды /help"""
-    help_text = """
-🤖 **Доступные команды:**
 
-/start - Запустить бота
-/help - Показать справку
-/wallet - Управление кошельками
-/token - Управление токенами
-/balance - Проверить баланс
+# ============ MAIN ============
 
-📊 **Основные функции:**
-- Отслеживание балансов
-- Уведомления о транзакциях
-- Управление несколькими кошельками
-    """
-    await update.message.reply_text(help_text, parse_mode='Markdown')
 def main():
-    """Основная функция запуска"""
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN не найден. Проверь переменную окружения.")
         raise SystemExit("BOT_TOKEN is missing")
-    
-    # Проверка API ключей
-    if not MORALIS_API_KEY:
-        logger.warning("⚠️ MORALIS_API_KEY не настроен - портфель EVM будет ограничен")
-    
-    # Проверка валидности данных при запуске
-    logger.info(f"🤖 Загрузка данных: {len(user_wallets)} пользователей, {len(tracked_tokens)} токенов")
 
     app = (
         Application.builder()
@@ -699,7 +2152,6 @@ def main():
         .build()
     )
 
-    # Регистрация обработчиков
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("price", price))
@@ -711,8 +2163,9 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
 
-    logger.info("🤖 Бот запущен с улучшениями безопасности!")
+    logger.info("🤖 Бот запущен, начинаем polling…")
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()

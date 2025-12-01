@@ -44,9 +44,9 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 AI_PROVIDERS = {
     "groq": {
         "url": "https://api.groq.com/openai/v1/chat/completions",
-        "model": "llama-3.1-70b-versatile",
+        "model": "llama-3.3-70b-versatile",  # новая модель
         "key": GROQ_API_KEY,
-        "label": "Groq Llama 3.1",
+        "label": "Groq Llama 3.3",
     },
     "openrouter": {
         "url": "https://openrouter.ai/api/v1/chat/completions",
@@ -710,11 +710,12 @@ async def ai_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = await call_text_ai(provider, full_prompt)
     label = AI_PROVIDERS.get(provider, {}).get("label", provider)
 
-    await q.edit_message_text(
-        f"**{label}:**\n\n{answer}",
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard(),
-    )
+await q.edit_message_text(
+    f"**{label}:**\n\n{answer}",
+    parse_mode="Markdown",
+    reply_markup=None,
+)
+
 
 # ============ КОМАНДЫ ПОРТФЕЛЯ ============
 

@@ -38,6 +38,23 @@ BASESCAN_API_KEY = os.getenv("BASESCAN_API_KEY", "")
 BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
 MORALIS_API_KEY = os.getenv("MORALIS_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+
+AI_PROVIDERS = {
+    "groq": {
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "model": "llama-3.1-70b-versatile",
+        "key": GROQ_API_KEY,
+        "label": "Groq Llama 3.1",
+    },
+    "openrouter": {
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "model": "meta-llama/llama-3.1-8b-instruct",
+        "key": OPENROUTER_API_KEY,
+        "label": "OpenRouter Llama 3.1",
+    },
+}
 
 # ============ НАСТРОЙКИ ============
 
@@ -357,12 +374,13 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton("➕ Добавить токен"), KeyboardButton("📋 Watchlist")],
             [KeyboardButton("💼 Мой портфель"), KeyboardButton("📊 Статистика")],
-            [KeyboardButton("🔗 Инструменты"), KeyboardButton("⚙️ Настройки")],
-            [KeyboardButton("❓ Справка")],
+            [KeyboardButton("🤖 ИИ помощник"), KeyboardButton("🔗 Инструменты")],
+            [KeyboardButton("⚙️ Настройки"), KeyboardButton("❓ Справка")],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
     )
+
 
 
 def detect_pump_dump(history: deque) -> str:
@@ -385,6 +403,71 @@ def detect_pump_dump(history: deque) -> str:
     
     return ""
 
+async def call_text_ai(provider: str, prompt: str) -> str:
+    """Вызов текстовой модели (Groq или OpenRouter)."""
+    cfg = AI_PROVIDERS.get(provider)
+    if not cfg or not cfg.get("key"):
+        return f"❌ Модель {provider} недоступна (нет API ключа)."
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {cfg['key']}",
+    }
+    if provider == "openrouter":
+        headers["HTTP-Referer"] = "https://yourbot.example"
+        headers["X-Title"] = "Your Telegram Bot"
+
+    body = {
+        "model": cfg["model"],
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Ты ассистент-криптоаналитик. Отвечай кратко и по делу, "
+                    "используя данные портфеля и watchlist пользователя."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 800,
+    }
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(20)) as session:
+            async with session.post(cfg["url"], headers=headers, json=body) as resp:
+                data = await resp.json()
+    except Exception as e:
+        logger.error(f"AI {provider} error: {e}")
+        return f"❌ Ошибка запроса к {provider}: {e}"
+
+    try:
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        logger.error(f"Unexpected AI response {provider}: {data}")
+        return "❌ Не удалось разобрать ответ модели."
+
+
+async def get_user_context(user_id: int) -> str:
+    """Краткий контекст по портфелю и watchlist для промпта."""
+    udata = get_user_wallets(user_id)
+    wallets = udata.get("wallets", {})
+    tokens = [
+        addr
+        for addr, info in tracked_tokens.items()
+        if user_id in info.get("subscribers", {})
+    ]
+
+    total_usd = 0.0
+    for w in wallets.values():
+        total_usd += float(w.get("usd_value", 0) or 0)
+
+    chains = {w.get("chain", "unknown") for w in wallets.values()}
+
+    return (
+        f"Кошельков: {len(wallets)}, портфель ≈ ${total_usd:,.0f}, "
+        f"watchlist токенов: {len(tokens)}, сети: {', '.join(sorted(chains)) or 'нет'}."
+    )
 
 # ============ КОМАНДЫ ============
 
@@ -539,6 +622,99 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(settings_text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
 
+async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /ai — выбор модели и запрос."""
+    user_id = update.effective_user.id
+    text = " ".join(context.args).strip()
+
+    active = {k: v for k, v in AI_PROVIDERS.items() if v.get("key")}
+    if not active:
+        await update.message.reply_text(
+            "❌ Нет доступных AI моделей. Проверь GROQ_API_KEY и OPENROUTER_API_KEY.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    if not text:
+        labels = ", ".join(v["label"] for v in active.values())
+        await update.message.reply_text(
+            "🤖 Использование: `/ai твой вопрос`\n\n"
+            "Примеры:\n"
+            "• `/ai проанализируй мой портфель`\n"
+            "• `/ai оцени риски токенов из watchlist`\n"
+            "• `/ai предложи пороги алертов по цене и объёму`.\n\n"
+            f"Доступные модели: {labels}",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    user_ctx = await get_user_context(user_id)
+
+    rows = []
+    if "groq" in active:
+        rows.append(
+            [InlineKeyboardButton("🆓 Groq (Llama 3.1)", callback_data=f"ai:groq:{text[:150]}")]
+        )
+    if "openrouter" in active:
+        rows.append(
+            [InlineKeyboardButton("🆓 OpenRouter Llama", callback_data=f"ai:openrouter:{text[:150]}")]
+        )
+    if len(rows) > 1:
+        rows.append(
+            [InlineKeyboardButton("🎯 Mix (автовыбор)", callback_data=f"ai:mix:{text[:150]}")]
+        )
+
+    keyboard = InlineKeyboardMarkup(rows)
+
+    await update.message.reply_text(
+        f"🤖 Запрос: `{text}`\n"
+        f"📊 Контекст: {user_ctx}",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
+async def ai_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатий на кнопки AI."""
+    q = update.callback_query
+    data = q.data or ""
+    user_id = q.from_user.id
+
+    if not data.startswith("ai:"):
+        return
+
+    _, provider, short_query = data.split(":", 2)
+
+    # Mix: выбираем модель автоматически
+    if provider == "mix":
+        has_groq = bool(AI_PROVIDERS.get("groq", {}).get("key"))
+        has_or = bool(AI_PROVIDERS.get("openrouter", {}).get("key"))
+        low = short_query.lower()
+        if ("код" in low or "contract" in low or "script" in low) and has_or:
+            provider = "openrouter"
+        elif has_groq:
+            provider = "groq"
+        elif has_or:
+            provider = "openrouter"
+        else:
+            await q.answer("Нет активных моделей.")
+            return
+
+    await q.answer("🤖 Думаю...")
+    await q.edit_message_text("🤖 Генерирую ответ...")
+
+    user_ctx = await get_user_context(user_id)
+    full_prompt = f"{user_ctx}\n\nВопрос пользователя: {short_query}"
+
+    answer = await call_text_ai(provider, full_prompt)
+    label = AI_PROVIDERS.get(provider, {}).get("label", provider)
+
+    await q.edit_message_text(
+        f"**{label}:**\n\n{answer}",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
+    )
 
 # ============ КОМАНДЫ ПОРТФЕЛЯ ============
 
@@ -617,10 +793,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = (update.message.text or "").strip()
     logger.info(f"MSG от {user_id}: {text[:80]}")
+    # Проверяем, ждём ли сейчас вопрос для ИИ
+    awaiting_ai = context.user_data.get("awaiting_ai_question", False)
 
     # Кнопки главного меню
     if text == "📋 Watchlist":
         await watchlist(update, context)
+        return
+        
+    if text == "🤖 ИИ помощник":
+        # включаем режим "ждём вопрос к ИИ"
+        context.user_data["awaiting_ai_question"] = True
+        context.user_data.pop("last_token_addr", None)
+
+        await update.message.reply_text(
+            "🤖 Напиши свой вопрос для ИИ.\n"
+            "Можешь без /ai, просто текст.\n"
+            "Например: `проанализируй мой портфель и риски`.",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
         return
 
     if text == "💼 Мой портфель":
@@ -653,6 +845,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_menu_keyboard(),
         )
         return
+
 
     # ============ ОБРАБОТКА ПОРТФЕЛЯ ============
     if user_id in pending_wallet_input:
@@ -927,25 +1120,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(
-                    "📈 Цена", callback_data=f"select_price:{address}"
-                ),
-                InlineKeyboardButton(
-                    "🏦 Капа", callback_data=f"select_mcap:{address}"
-                ),
-                InlineKeyboardButton(
-                    "🛰 Объём", callback_data=f"select_vol:{address}"
-                ),
+                InlineKeyboardButton("📈 Цена", callback_data=f"select_price:{address}"),
+                InlineKeyboardButton("📊 Капитализация", callback_data=f"select_mcap:{address}"),
             ],
             [
-                InlineKeyboardButton(
-                    "✅ Все три параметра", callback_data=f"select_all:{address}"
-                ),
+                InlineKeyboardButton("📊 Объем m5", callback_data=f"select_vol:{address}"),
+            ],
+            [
+                InlineKeyboardButton("⚙️ Все параметры", callback_data=f"select_all:{address}"),
+            ],
+            [
+                InlineKeyboardButton("🤖 Спросить ИИ", callback_data=f"askai:{address}"),
             ],
         ]
     )
 
+
     await update.message.reply_text(text_resp, reply_markup=keyboard, parse_mode="Markdown")
+    # === Если ждём вопрос для ИИ, а пользователь прислал обычный текст ===
+    if awaiting_ai and not text.startswith("/"):
+        # сбрасываем флаг, чтобы следующий текст не ушёл в ИИ случайно
+        context.user_data["awaiting_ai_question"] = False
+
+        # формируем полный вопрос для /ai и переиспользуем ai_chat
+        # имитируем, что пользователь написал "/ai <вопрос>"
+        update.message.text = f"/ai {text}"
+        await ai_chat(update, context)
+        return
+    
 # ------------ КНОПКИ ВЫБОРА ПАРАМЕТРОВ ============
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -983,6 +1185,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(tooltips[tooltip_key], show_alert=False)
     else:
         await query.answer()
+    # ==== КНОПКА "СПРОСИТЬ ИИ" ДЛЯ КОНКРЕТНОГО ТОКЕНА ====
+    if data.startswith("askai:"):
+        address = data.split(":", 1)[1]
+
+        info = tracked_tokens.get(address, {})
+        label = format_addr_with_meta(address, info)
+
+        # сохраняем последний выбранный токен и включаем режим "ждём вопрос к ИИ"
+        context.user_data["last_token_addr"] = address
+        context.user_data["awaiting_ai_question"] = True
+
+        await query.message.reply_text(
+            f"🤖 ИИ будет учитывать токен {label}.\n"
+            f"Теперь просто напиши свой вопрос (можно без /ai).\n"
+            f"Например: `проанализируй этот токен и сравни с моим портфелем`.",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
 
     state = pending_threshold_input.get(user_id) or {
         "pending_volume_for": None,
@@ -2160,8 +2382,11 @@ def main():
     app.add_handler(CommandHandler("settings", settings))
     app.add_handler(CommandHandler("watchlist", watchlist))
     app.add_handler(CommandHandler("unwatch", unwatch))
+    app.add_handler(CommandHandler("ai", ai_chat))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(ai_callback, pattern="^ai:"))
     app.add_handler(CallbackQueryHandler(button_callback))
+
 
     logger.info("🤖 Бот запущен, начинаем polling…")
     app.run_polling(drop_pending_updates=True)

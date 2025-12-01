@@ -710,11 +710,11 @@ async def ai_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = await call_text_ai(provider, full_prompt)
     label = AI_PROVIDERS.get(provider, {}).get("label", provider)
 
-await q.edit_message_text(
+    await q.edit_message_text(
     f"**{label}:**\n\n{answer}",
     parse_mode="Markdown",
     reply_markup=None,
-)
+    )
 
 
 # ============ КОМАНДЫ ПОРТФЕЛЯ ============

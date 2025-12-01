@@ -151,70 +151,81 @@ async def get_evm_portfolio_moralis(address: str, chain: str = "ethereum") -> di
         "base": "base",
         "bsc": "bsc",
     }
+
     moralis_chain = chain_map.get(chain)
     if not moralis_chain:
         logger.warning(f"⚠️ Moralis: unsupported chain={chain}")
         return {"balance": 0, "usd_value": 0, "tokens": []}
 
-    # Используем метод getWalletTokenBalancesPrices
-    url = f"https://deep-index.moralis.io/api/v2.2/wallets/{address}/tokens"
-
-    params = {
-        "chain": moralis_chain,
-        "exclude_spam": "true",
-    }
-
+    # Получаем нативный баланс
+    url_native = f"https://deep-index.moralis.io/api/v2.2/wallets/{address}/balance"
     headers = {
         "X-API-Key": MORALIS_API_KEY,
         "accept": "application/json",
     }
 
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(20)) as session:
-            async with session.get(url, params=params, headers=headers) as resp:
-                data = await resp.json()
-    except Exception as e:
-        logger.error(f"⚠️ Moralis error for {chain} {address}: {e}")
-        return {"balance": 0, "usd_value": 0, "tokens": []}
-
-    tokens = []
-    total_usd = 0.0
+    native_usd = 0.0
     native_balance = 0.0
 
-    for t in data or []:
-        try:
-            symbol = t.get("symbol") or ""
-            name = t.get("name") or ""
-            balance = float(t.get("balance_formatted") or t.get("balance", 0) or 0)
-            usd_value = float(t.get("usd_value", 0) or 0)
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(15)) as session:
+            # Нативный баланс
+            params_native = {"chain": moralis_chain}
+            async with session.get(url_native, params=params_native, headers=headers) as resp:
+                native_data = await resp.json()
+                native_balance_wei = float(native_data.get("balance") or 0)
+                native_balance = native_balance_wei / 1e18
+                native_usd = float(native_data.get("usd_value") or 0)
+    except Exception as e:
+        logger.error(f"⚠️ Moralis native balance error for {chain} {address}: {e}")
+        native_balance = 0.0
 
-            total_usd += usd_value
+    # Получаем токены
+    url_tokens = f"https://deep-index.moralis.io/api/v2.2/wallets/{address}/tokens"
+    tokens = []
+    tokens_usd = 0.0
 
-            if t.get("is_native"):
-                native_balance = balance
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(20)) as session:
+            params_tokens = {
+                "chain": moralis_chain,
+                "exclude_spam": "true",
+            }
+            async with session.get(url_tokens, params=params_tokens, headers=headers) as resp:
+                data = await resp.json()
+                if isinstance(data, list):
+                    for t in data:
+                        try:
+                            symbol = t.get("symbol") or ""
+                            name = t.get("name") or ""
+                            balance = float(t.get("balance_formatted") or t.get("balance") or 0)
+                            usd_value = float(t.get("usd_value") or 0)
+                            tokens_usd += usd_value
 
-            tokens.append(
-                {
-                    "symbol": symbol,
-                    "name": name,
-                    "balance": balance,
-                    "usd_value": usd_value,
-                }
-            )
-        except Exception:
-            continue
+                            tokens.append({
+                                "symbol": symbol,
+                                "name": name,
+                                "balance": balance,
+                                "usd_value": usd_value,
+                            })
+                        except Exception:
+                            continue
+    except Exception as e:
+        logger.error(f"⚠️ Moralis tokens error for {chain} {address}: {e}")
+
+    total_usd = native_usd + tokens_usd
 
     logger.info(
         f"Moralis portfolio chain={chain} addr={short_addr(address)} "
-        f"native={native_balance} total_usd={total_usd}"
+        f"native={native_balance:.4f} tokens_count={len(tokens)} total_usd={total_usd}"
     )
 
-    # Формат под update_wallet_balance
     return {
         "balance": round(native_balance, 6),
         "usd_value": round(total_usd, 2),
         "tokens": tokens,
     }
+
 
 
 async def get_evm_balance(address: str, chain: str = "ethereum") -> dict:
@@ -449,22 +460,56 @@ async def call_text_ai(provider: str, prompt: str) -> str:
 
 
 async def get_user_context(user_id: int) -> str:
-    """Краткий контекст по портфелю и watchlist для промпта."""
+    """Контекст по портфелю и watchlist для промпта ИИ."""
     udata = get_user_wallets(user_id)
     wallets = udata.get("wallets", {})
-    tokens = [
-        addr
-        for addr, info in tracked_tokens.items()
-        if user_id in info.get("subscribers", {})
-    ]
 
-    total_usd = 0.0
-    for w in wallets.values():
-        total_usd += float(w.get("usd_value", 0) or 0)
+    # ПОРТФЕЛЬ
+    portfolio_text = ""
+    if wallets:
+        portfolio_text = "📊 **ПОРТФЕЛЬ:**\n"
+        total_portfolio_usd = 0.0
+        for wallet_id, w in wallets.items():
+            chain = w.get("chain", "unknown").upper()
+            name = w.get("name", chain)
+            balance = float(w.get("balance", 0) or 0)
+            usd = float(w.get("usd_value", 0) or 0)
+            total_portfolio_usd += usd
+            portfolio_text += f"  • {name} ({chain}): {balance:.4f} ≈ ${usd:,.2f}\n"
 
-    chains = {w.get("chain", "unknown") for w in wallets.values()}
+        portfolio_text += f"  **ИТОГО: ${total_portfolio_usd:,.2f}**\n\n"
+    else:
+        portfolio_text = "📊 **ПОРТФЕЛЬ:** Пуст\n\n"
 
-    return (
+    # WATCHLIST
+    watchlist_text = "🛰️ **WATCHLIST:**\n"
+    has_active_watchlist = False
+    for address, info in tracked_tokens.items():
+        sub = info.get("subscribers", {}).get(user_id)
+        if not sub:
+            continue
+
+        symbol = info.get("symbol", "?")
+        pt = sub.get("price_threshold")
+        mt = sub.get("mcap_threshold")
+        vt = sub.get("vol_threshold")
+
+        if pt is not None or mt is not None or vt is not None:
+            has_active_watchlist = True
+            params = []
+            if pt is not None:
+                params.append(f"цена {pt:.1f}%")
+            if mt is not None:
+                params.append(f"капа {mt:.1f}%")
+            if vt is not None:
+                params.append(f"объём {vt:.1f}%")
+            watchlist_text += f"  • {symbol}: {', '.join(params)}\n"
+
+    if not has_active_watchlist:
+        watchlist_text += "  (нет активных отслеживаний)\n"
+
+    return portfolio_text + watchlist_text
+
         f"Кошельков: {len(wallets)}, портфель ≈ ${total_usd:,.0f}, "
         f"watchlist токенов: {len(tokens)}, сети: {', '.join(sorted(chains)) or 'нет'}."
     )
@@ -727,12 +772,18 @@ async def ai_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = await call_text_ai(provider, full_prompt)
     label = AI_PROVIDERS.get(provider, {}).get("label", provider)
 
+
     await q.edit_message_text(
-    f"**{label}:**\n\n{answer}",
-    parse_mode="Markdown",
-    reply_markup=None,
+        f"**{label}:**\n\n{answer}",
+        parse_mode="Markdown",
+        reply_markup=None,
     )
 
+    # ========== ОЧИЩАЕМ ФЛАГИ ИИ ==========
+    context.user_data.pop("awaiting_ai_question", None)
+    context.user_data.pop("last_ai_query", None)
+    context.user_data.pop("last_token_addr", None)
+    # =========================================
 
 # ============ КОМАНДЫ ПОРТФЕЛЯ ============
 
@@ -810,20 +861,18 @@ async def view_portfolio_full(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = (update.message.text or "").strip()
-    logger.info(f"MSG от {user_id}: {text[:80]}")
-    # Проверяем, ждём ли сейчас вопрос для ИИ
-    awaiting_ai = context.user_data.get("awaiting_ai_question", False)
 
-    # Кнопки главного меню
+    logger.info(f"MSG от {user_id}: {text[:80]}")
+
+    # ========== КНОПКИ ГЛАВНОГО МЕНЮ (ГЛАВНЫЙ ПРИОРИТЕТ) ==========
+
     if text == "📋 Watchlist":
         await watchlist(update, context)
         return
-        
+
     if text == "🤖 ИИ помощник":
-        # включаем режим "ждём вопрос к ИИ"
         context.user_data["awaiting_ai_question"] = True
         context.user_data.pop("last_token_addr", None)
-
         await update.message.reply_text(
             "🤖 Напиши свой вопрос для ИИ.\n"
             "Можешь без /ai, просто текст.\n"
@@ -863,6 +912,127 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_menu_keyboard(),
         )
         return
+
+    # ========== ЖДЁМ ВОПРОС ДЛЯ ИИ ==========
+
+    if context.user_data.get("awaiting_ai_question"):
+        # Отправляем в /ai как будто использовал команду
+        context.args = text.split()
+        context.user_data["awaiting_ai_question"] = False
+        await ai_chat(update, context)
+        return
+
+    # ========== ПОРТФЕЛЬ: ВВОД АДРЕСА КОШЕЛЬКА ==========
+
+    if user_id in pending_wallet_input:
+        state = pending_wallet_input[user_id]
+        if text == "Отмена":
+            pending_wallet_input.pop(user_id, None)
+            await update.message.reply_text("❌ Отмена", reply_markup=main_menu_keyboard())
+            return
+
+        if state.get("step") == "address":
+            if len(text) < 30:
+                await update.message.reply_text(
+                    "❌ Адрес слишком короткий. Проверь и отправь снова.",
+                    reply_markup=main_menu_keyboard()
+                )
+                return
+
+            state["address"] = text
+            state["step"] = "chain"
+
+            keyboard = ReplyKeyboardMarkup(
+                [
+                    [KeyboardButton("Solana"), KeyboardButton("Ethereum")],
+                    [KeyboardButton("Base"), KeyboardButton("BSC")],
+                    [KeyboardButton("Отмена")]
+                ],
+                resize_keyboard=True,
+                one_time_keyboard=True
+            )
+
+            await update.message.reply_text(
+                "🌐 Выбери сеть кошелька:",
+                reply_markup=keyboard
+            )
+            return
+
+        if state.get("step") == "chain":
+            chain_map = {
+                "solana": "solana",
+                "ethereum": "ethereum",
+                "base": "base",
+                "bsc": "bsc"
+            }
+
+            chain = chain_map.get(text.lower())
+            if not chain:
+                await update.message.reply_text(
+                    "❌ Выбери из предложенных вариантов.",
+                    reply_markup=main_menu_keyboard()
+                )
+                return
+
+            state["chain"] = chain
+            state["step"] = "name"
+
+            keyboard = ReplyKeyboardMarkup(
+                [[KeyboardButton("Отмена")]],
+                resize_keyboard=True,
+                one_time_keyboard=True
+            )
+
+            await update.message.reply_text(
+                "📝 Введи название для этого кошелька (например: 'Основной', 'Trading'):",
+                reply_markup=keyboard
+            )
+            return
+
+        if state.get("step") == "name":
+            address = state["address"]
+            chain = state["chain"]
+            name = text if text != "Отмена" else chain.capitalize()
+
+            user_data = get_user_wallets(user_id)
+            wallet_id = f"wallet_{len(user_data['wallets']) + 1}"
+
+            user_data["wallets"][wallet_id] = {
+                "address": address,
+                "chain": chain,
+                "name": name,
+                "added_at": int(time.time()),
+                "balance": 0,
+                "usd_value": 0,
+                "balance_history": []
+            }
+
+            save_data()
+            pending_wallet_input.pop(user_id, None)
+
+            await update.message.reply_text(
+                f"✅ Кошелек **{name}** добавлен!\n\n"
+                f"🌐 Сеть: {chain.upper()}\n"
+                f"📍 {short_addr(address)}\n\n"
+                f"🔄 Обновляю баланс...",
+                reply_markup=main_menu_keyboard(),
+                parse_mode="Markdown"
+            )
+
+            # Обновляем баланс
+            await update_wallet_balance(user_id, wallet_id)
+            return
+
+    # ========== WATCHLIST: ВВОД ПОРОГОВ ==========
+
+    state = pending_threshold_input.get(user_id) or {
+        "pending_volume_for": None,
+        "pending_price_for": None,
+        "pending_mcap_for": None,
+        "pending_multi": None,
+        "multi_params": [],
+        "multi_step": 0,
+    }
 
 
     # ============ ОБРАБОТКА ПОРТФЕЛЯ ============

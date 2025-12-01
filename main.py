@@ -649,20 +649,24 @@ async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # сохраним полный вопрос для колбэка
+    short_query = text[:150]
+    context.user_data["last_ai_query"] = short_query
+
     user_ctx = await get_user_context(user_id)
 
     rows = []
     if "groq" in active:
         rows.append(
-            [InlineKeyboardButton("🆓 Groq (Llama 3.1)", callback_data=f"ai:groq:{text[:150]}")]
+            [InlineKeyboardButton("🆓 Groq (Llama 3.3)", callback_data="ai:groq")]
         )
     if "openrouter" in active:
         rows.append(
-            [InlineKeyboardButton("🆓 OpenRouter Llama", callback_data=f"ai:openrouter:{text[:150]}")]
+            [InlineKeyboardButton("🆓 OpenRouter Llama", callback_data="ai:openrouter")]
         )
     if len(rows) > 1:
         rows.append(
-            [InlineKeyboardButton("🎯 Mix (автовыбор)", callback_data=f"ai:mix:{text[:150]}")]
+            [InlineKeyboardButton("🎯 Mix (автовыбор)", callback_data="ai:mix")]
         )
 
     keyboard = InlineKeyboardMarkup(rows)
@@ -675,6 +679,7 @@ async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
 async def ai_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка нажатий на кнопки AI."""
     q = update.callback_query
@@ -684,7 +689,19 @@ async def ai_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not data.startswith("ai:"):
         return
 
-    _, provider, short_query = data.split(":", 2)
+    # из callback берём только провайдера
+    try:
+        _, provider = data.split(":", 1)
+    except ValueError:
+        await q.answer("Некорректная кнопка.")
+        return
+
+    # сам вопрос берём из user_data
+    short_query = (context.user_data.get("last_ai_query") or "").strip()
+    if not short_query:
+        await q.answer("Вопрос для ИИ не найден, попробуй ещё раз через /ai.")
+        return
+
 
     # Mix: выбираем модель автоматически
     if provider == "mix":

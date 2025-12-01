@@ -1137,16 +1137,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
     await update.message.reply_text(text_resp, reply_markup=keyboard, parse_mode="Markdown")
-    # === Если ждём вопрос для ИИ, а пользователь прислал обычный текст ===
-    if awaiting_ai and not text.startswith("/"):
-        # сбрасываем флаг, чтобы следующий текст не ушёл в ИИ случайно
-        context.user_data["awaiting_ai_question"] = False
 
-        # формируем полный вопрос для /ai и переиспользуем ai_chat
-        # имитируем, что пользователь написал "/ai <вопрос>"
-        update.message.text = f"/ai {text}"
-        await ai_chat(update, context)
-        return
     
 # ------------ КНОПКИ ВЫБОРА ПАРАМЕТРОВ ============
 

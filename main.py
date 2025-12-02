@@ -505,12 +505,11 @@ async def get_user_context(user_id: int) -> str:
                 params.append(f"объём {vt:.1f}%")
             watchlist_text += f"  • {symbol}: {', '.join(params)}\n"
 
-        if not has_active_watchlist:
+    # ✅ Проверка ПОСЛЕ цикла, не внутри!
+    if not has_active_watchlist:
         watchlist_text += "  (нет активных отслеживаний)\n"
 
     return portfolio_text + watchlist_text
-
-
 
 # ============ КОМАНДЫ ============
 

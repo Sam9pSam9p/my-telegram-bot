@@ -873,7 +873,8 @@ def main():
     app.add_error_handler(error_handler)
     
     # Завершение (БЛОК 6)
-    app.post_shutdown(shutdown_handler)
+    # app.post_shutdown(shutdown_handler)  # Закомментировано (не поддерживается в ptb-21.4)
+
     
     logger.info("✅ Обработчики зарегистрированы")
     logger.info("📡 Бот готов к работе!")

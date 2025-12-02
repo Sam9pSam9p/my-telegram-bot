@@ -126,31 +126,42 @@ def get_user_wallets(user_id: int) -> dict:
 # ============ ФУНКЦИИ ПОЛУЧЕНИЯ БАЛАНСА ============
 
 async def get_solana_balance(address: str) -> dict:
-    """Получает баланс кошелька Solana"""
-    try:
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getBalance",
-            "params": [address]
-        }
-        async with aiohttp.ClientSession() as session:
-            async with session.post(SOLANA_RPC, json=payload, timeout=aiohttp.ClientTimeout(5)) as resp:
-                data = await resp.json()
-                balance_lamports = data.get("result", {}).get("value", 0)
-                balance_sol = balance_lamports / 1e9
-                
-                async with session.get("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd") as price_resp:
-                    price_data = await price_resp.json()
-                    sol_price = price_data.get("solana", {}).get("usd", 0)
-                    return {
-                        "balance": round(balance_sol, 4),
-                        "usd_value": round(balance_sol * sol_price, 2),
-                        "price": sol_price
-                    }
-    except Exception as e:
-        logger.error(f"❌ Ошибка Solana баланса: {e}")
-        return {"balance": 0, "usd_value": 0, "price": 0}
+    """Получает баланс кошелька Solana с retry"""
+    rpc_endpoints = [
+        "https://rpc.ankr.com/solana",
+        "https://solana.public-rpc.com",
+        "https://api.mainnet-beta.solana.com",
+    ]
+    
+    for rpc_url in rpc_endpoints:
+        try:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getBalance",
+                "params": [address]
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(rpc_url, json=payload, timeout=aiohttp.ClientTimeout(5)) as resp:
+                    data = await resp.json()
+                    if "result" in data:
+                        balance_lamports = data["result"]["value"]
+                        balance_sol = balance_lamports / 1e9
+                        # получи цену SOL
+                        async with session.get("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd") as price_resp:
+                            price_data = await price_resp.json()
+                            sol_price = price_data.get("solana", {}).get("usd", 0)
+                        return {
+                            "balance": round(balance_sol, 4),
+                            "usd_value": round(balance_sol * sol_price, 2),
+                            "price": sol_price
+                        }
+        except Exception as e:
+            logger.warning(f"⚠️ RPC {rpc_url} ошибка: {e}")
+            continue
+    
+    logger.error("❌ Все RPC endpoints не доступны")
+    return {"balance": 0, "usd_value": 0, "price": 0}
 
 async def get_evm_portfolio_moralis(address: str, chain: str = "ethereum") -> dict:
     """Получает EVM-портфель через Moralis Wallet API"""
